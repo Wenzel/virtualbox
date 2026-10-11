@@ -63,12 +63,46 @@ hanging the VM teardown.
 
 Later commands are planned as follows:
 
-- physical memory read/write: served on the server thread through PGM's
-  external physical access functions, so RAM accesses don't hop to an EMT;
+- physical memory write: served on the server thread like reads (below);
 - full register set of one vCPU: one request to that vCPU's EMT reading or
   writing the CPU context directly;
 - pause/resume: VirtualBox's standard suspend/resume, visible to the GUI and
   `VBoxManage`.
+
+## Physical memory reads
+
+- Served on the server thread, page by page, with
+  `PGMR3PhysGCPhys2CCPtrReadOnlyExternal` (any thread, PGM lock held only
+  while mapping) and a `memcpy`. RAM never waits for an EMT, so reads cost the
+  same whether the VM runs or is paused.
+- `PGMR3PhysReadExternal` was not used: it hands pages with an access handler
+  of type ALL (MMIO) or special aliased MMIO (the APIC access page) to an EMT
+  and runs `PGMPhysRead` there, which calls the device's MMIO read handler,
+  and it fills unassigned addresses with 0xff without saying so. A read must
+  never touch a device and must report what it could not read.
+- The read-only mapping function refuses MMIO and special aliased MMIO pages
+  (`VERR_PGM_PHYS_PAGE_RESERVED`) and unassigned addresses fail the lookup, so
+  readable pages are exactly those of the `IMachineDebugger` memory methods
+  (`DBGFR3MemRead`, via `PGMPhysGCPhys2CCPtrReadOnly`, makes the same check):
+  RAM, ROM and MMIO2. The special aliased MMIO page is reported unreadable
+  rather than read as the zero page it is backed by. Zero (not yet allocated)
+  RAM pages are mapped read-only to the shared zero page and read as zeros,
+  without allocating them.
+- Every page gets a status in the reply and unreadable bytes are zeros, so an
+  MMIO hole in a bulk read costs nothing more than the hole.
+- Size limit: a reply must fit the 64 KiB message, i.e. 15 full pages per
+  request, and the client splits bigger reads. Considered: replies split over
+  several records with a "more" flag, or a bigger negotiated message size.
+  Both save little. Measured on a paused 5 GiB guest (Rust client, one
+  request at a time): one-page requests take 5 to 9 microseconds each
+  (450 to 800 MiB/s), and 15-page requests reach 2.6 to 5 GB/s, so the
+  round trip is no longer what limits bulk reads. A page-by-page reader, the
+  common case (one 4 KiB page per call), pays one round trip either way. A multi-record reply would also make the client
+  reassemble and keep events (version 2) from interleaving with it, and a
+  record much bigger than 64 KiB needs a socket send buffer above the
+  default `net.core.wmem_max`. Revisit with measurements.
+- `VMI_MSG_RAM_RANGES` uses `PGMR3PhysGetRamBootZeroedRanges`, which lists the
+  RAM ranges that are not ad hoc (ROM, MMIO, MMIO2) and merges contiguous ones.
 
 ## Security
 

@@ -48,6 +48,8 @@ connection.
 | Code     | Name            | Body | Since |
 |----------|-----------------|------|-------|
 | `0x0001` | `VMI_MSG_HELLO` | `VMIHELLO` | 1 |
+| `0x0002` | `VMI_MSG_PHYS_READ` | see Physical memory read | 1 |
+| `0x0003` | `VMI_MSG_RAM_RANGES` | see RAM ranges | 1 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -77,6 +79,63 @@ Any other request before a successful handshake is answered with
 `VERR_WRONG_ORDER` (-22) and the server closes. A second hello after the
 handshake, whatever its body, is answered with `VERR_WRONG_ORDER` and the connection stays up.
 
+## Physical memory read
+
+`VMI_MSG_PHYS_READ` reads guest physical memory: several ranges per request,
+with a status per guest page (4 KiB).
+
+Request body: one or more `VMIPHYSRANGE` (16 bytes each):
+
+| Offset | Size | Field         | Meaning |
+|-------:|-----:|---------------|---------|
+| 0      | 8    | `GCPhys`      | Guest physical address of the first byte. |
+| 8      | 4    | `cb`          | Number of bytes, nonzero. The range must not wrap around. |
+| 12     | 4    | `u32Reserved` | 0. |
+
+Reply body, in request order:
+
+1. one `int32_t` status per guest page that a range overlaps (a range of `cb`
+   bytes at `GCPhys` overlaps `((GCPhys + cb - 1) >> 12) - (GCPhys >> 12) + 1`
+   pages), then
+2. the `cb` bytes of every range.
+
+A page's status is `VINF_SUCCESS` (0) if it was read, otherwise the reason it
+is unreadable, and its bytes are zeros:
+
+- `VERR_PGM_PHYS_PAGE_RESERVED` (-1618): MMIO, including the special aliased
+  MMIO pages such as the local APIC page. Devices are never accessed.
+- `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` (-1605): no memory at that address.
+
+RAM, ROM and MMIO2 (e.g. VRAM) pages are readable. An unreadable page never
+fails the request: the header `rc` is `VINF_SUCCESS` whenever the request is
+well formed. Otherwise it is, with an empty body and the connection kept:
+
+- `VERR_INVALID_PARAMETER` (-2): empty body or not a multiple of 16 bytes, a
+  range of 0 bytes, one that wraps around, or a nonzero reserved field;
+- `VERR_BUFFER_OVERFLOW` (-41): the reply would exceed the maximum message
+  size, i.e. `16 + 4 * pages + bytes > 65536`.
+
+So one request reads at most 15 full pages (61440 bytes). A client splits
+bigger reads into several requests. The reads are served on the server thread,
+without waiting for a vCPU, and the VM keeps running unless it is paused: a
+range is not read atomically.
+
+## RAM ranges
+
+`VMI_MSG_RAM_RANGES` returns the guest's RAM ranges, the physical address ranges
+backed by RAM (not ROM, MMIO or MMIO2), contiguous ones merged. The end of the
+highest is the guest's max physical address, which is above 4 GiB for guests
+with RAM above the MMIO hole.
+
+Request body: empty (anything else: `VERR_INVALID_PARAMETER`, connection kept).
+
+Reply body: `VMIRAMRANGE` entries (16 bytes each), sorted by address:
+
+| Offset | Size | Field         | Meaning |
+|-------:|-----:|---------------|---------|
+| 0      | 8    | `GCPhysFirst` | Guest physical address of the first byte. |
+| 8      | 8    | `GCPhysLast`  | Guest physical address of the last byte. |
+
 ## Disconnecting
 
 Either side may close the socket at any time. The server then accepts the next
@@ -84,4 +143,4 @@ client.
 
 ## Changes
 
-- Version 1: transport, header and handshake.
+- Version 1: transport, header and handshake; physical memory read and RAM ranges.
