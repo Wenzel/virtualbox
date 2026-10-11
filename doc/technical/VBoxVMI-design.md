@@ -71,10 +71,11 @@ Later commands are planned as follows:
 
 ## Physical memory reads
 
-- Served on the server thread, page by page, with
-  `PGMR3PhysGCPhys2CCPtrReadOnlyExternal` (any thread, PGM lock held only
-  while mapping) and a `memcpy`. RAM never waits for an EMT, so reads cost the
-  same whether the VM runs or is paused.
+- Served on the server thread with
+  `PGMR3PhysBulkGCPhys2CCPtrReadOnlyExternal`, mapping an all-readable request
+  under one PGM lock acquisition. If the bulk map fails, only then does the
+  server retry with `PGMR3PhysGCPhys2CCPtrReadOnlyExternal` page by page to
+  produce each status. Both APIs run on any thread without an EMT round trip.
 - `PGMR3PhysReadExternal` was not used: it hands pages with an access handler
   of type ALL (MMIO) or special aliased MMIO (the APIC access page) to an EMT
   and runs `PGMPhysRead` there, which calls the device's MMIO read handler,
@@ -93,14 +94,15 @@ Later commands are planned as follows:
 - Size limit: a reply must fit the 64 KiB message, i.e. 15 full pages per
   request, and the client splits bigger reads. Considered: replies split over
   several records with a "more" flag, or a bigger negotiated message size.
-  Both save little. Measured on a paused 5 GiB guest (Rust client, one
-  request at a time): one-page requests take 5 to 9 microseconds each
-  (450 to 800 MiB/s), and 15-page requests reach 2.6 to 5 GB/s, so the
-  round trip is no longer what limits bulk reads. A page-by-page reader, the
-  common case (one 4 KiB page per call), pays one round trip either way. A multi-record reply would also make the client
-  reassemble and keep events (version 2) from interleaving with it, and a
-  record much bigger than 64 KiB needs a socket send buffer above the
-  default `net.core.wmem_max`. Revisit with measurements.
+  Both save little. With the bulk PGM mapping implementation, the integration
+  benchmark on this development host read every RAM range of a paused 512 MiB
+  guest at 1916.1 MiB/s (511 MiB in 0.267 s), and a paused 5 GiB guest at
+  2825.7 MiB/s (5119 MiB in 1.812 s), using 1 MiB API reads split into
+  15-page wire requests. A page-by-page API caller still pays one round trip
+  per page. A multi-record reply would also make the client reassemble and
+  keep events (version 2) from interleaving with it, and a record much bigger
+  than 64 KiB needs a socket send buffer above the default
+  `net.core.wmem_max`. Revisit with measurements.
 - `VMI_MSG_RAM_RANGES` uses `PGMR3PhysGetRamBootZeroedRanges`, which lists the
   RAM ranges that are not ad hoc (ROM, MMIO, MMIO2) and merges contiguous ones.
 
