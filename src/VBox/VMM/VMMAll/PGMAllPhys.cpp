@@ -4917,6 +4917,27 @@ VMMDECL(int) PGMPhysSimpleReadGCPtr(PVMCPUCC pVCpu, void *pvDst, RTGCPTR GCPtrSr
 
 
 /**
+ * Maps a guest page by virtual address for PGMPhysSimpleWriteGCPtr and
+ * PGMPhysSimpleDirtyWriteGCPtr, refusing MMIO pages for the same reason as
+ * pgmPhysSimpleWriteMapPage does.
+ *
+ * @returns VBox status code, see PGMPhysGCPtr2CCPtr.
+ * @param   pVCpu       The cross context virtual CPU structure.
+ * @param   GCPtr       The guest virtual address of the page to map.
+ * @param   ppv         Where to store the address corresponding to GCPtr.
+ * @param   pLock       Where to store the lock information.
+ */
+static int pgmPhysSimpleWriteMapPageByGCPtr(PVMCPUCC pVCpu, RTGCPTR GCPtr, void **ppv, PPGMPAGEMAPLOCK pLock)
+{
+    RTGCPHYS GCPhys;
+    int rc = PGMPhysGCPtr2GCPhys(pVCpu, GCPtr, &GCPhys);
+    if (RT_SUCCESS(rc))
+        rc = pgmPhysSimpleWriteMapPage(pVCpu->CTX_SUFF(pVM), GCPhys, ppv, pLock);
+    return rc;
+}
+
+
+/**
  * Write to guest physical memory referenced by GC pointer.
  *
  * This function uses the current CR3/CR0/CR4 of the guest and will
@@ -4945,7 +4966,7 @@ VMMDECL(int) PGMPhysSimpleWriteGCPtr(PVMCPUCC pVCpu, RTGCPTR GCPtrDst, const voi
     /* map the 1st page */
     void *pvDst;
     PGMPAGEMAPLOCK Lock;
-    int rc = PGMPhysGCPtr2CCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
+    int rc = pgmPhysSimpleWriteMapPageByGCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
     if (RT_FAILURE(rc))
         return rc;
 
@@ -4971,7 +4992,7 @@ VMMDECL(int) PGMPhysSimpleWriteGCPtr(PVMCPUCC pVCpu, RTGCPTR GCPtrDst, const voi
     for (;;)
     {
         /* map the page */
-        rc = PGMPhysGCPtr2CCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
+        rc = pgmPhysSimpleWriteMapPageByGCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
         if (RT_FAILURE(rc))
             return rc;
 
@@ -5023,7 +5044,7 @@ VMMDECL(int) PGMPhysSimpleDirtyWriteGCPtr(PVMCPUCC pVCpu, RTGCPTR GCPtrDst, cons
     /* map the 1st page */
     void *pvDst;
     PGMPAGEMAPLOCK Lock;
-    int rc = PGMPhysGCPtr2CCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
+    int rc = pgmPhysSimpleWriteMapPageByGCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
     if (RT_FAILURE(rc))
         return rc;
 
@@ -5059,7 +5080,7 @@ VMMDECL(int) PGMPhysSimpleDirtyWriteGCPtr(PVMCPUCC pVCpu, RTGCPTR GCPtrDst, cons
     for (;;)
     {
         /* map the page */
-        rc = PGMPhysGCPtr2CCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
+        rc = pgmPhysSimpleWriteMapPageByGCPtr(pVCpu, GCPtrDst, &pvDst, &Lock);
         if (RT_FAILURE(rc))
             return rc;
 
