@@ -332,6 +332,10 @@ typedef struct VMINTUSERPERVM
 
     /** Pointer to the DBGC instance data. */
     void                           *pvDBGC;
+#ifdef VBOX_WITH_VMI
+    /** Pointer to the VBoxVMI server instance data. */
+    void                           *pvVMI;
+#endif
 
     /** TLS index for the VMINTUSERPERVMCPU pointer. */
     RTTLS                           idxTLS;

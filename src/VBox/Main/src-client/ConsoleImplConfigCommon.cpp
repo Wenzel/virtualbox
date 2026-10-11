@@ -5026,6 +5026,15 @@ int Console::i_configGuestDbg(ComPtr<IVirtualBox> pVBox, ComPtr<IMachine> pMachi
     strFile.append("dbgc-init");
     InsertConfigString(pDbgc, "GlobalInitScript", strFile);
 
+#ifdef VBOX_WITH_VMI
+    /* VBoxVMI server: default socket path, VBoxInternal/VMI/SocketPath overrides it. */
+    PCFGMNODE pVmi;
+    InsertConfigNode(pRoot, "VMI", &pVmi);
+    hrc = pMachine->COMGETTER(Id)(bstr.asOutParam());                                H();
+    strFile.printf("%svmi/%ls.sock", strVBoxHome.c_str(), bstr.raw());
+    InsertConfigString(pVmi, "SocketPath", strFile);
+#endif
+
     /*
      * Configure guest debug settings.
      */

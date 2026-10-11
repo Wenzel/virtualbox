@@ -76,6 +76,9 @@
 #include <VBox/vmm/hm.h>
 #include <VBox/vmm/gim.h>
 #include <VBox/vmm/gcm.h>
+#ifdef VBOX_WITH_VMI
+# include <VBox/vmm/vmi.h>
+#endif
 #include "VMInternal.h"
 #include <VBox/vmm/vmcc.h>
 
@@ -669,6 +672,14 @@ static DECLCALLBACK(int) vmR3CreateU(PUVM pUVM, uint32_t cCpus, PFNCFGMCONSTRUCT
                         {
                             pUVM->vm.s.pvDBGC = pvUser;
 #endif
+#ifdef VBOX_WITH_VMI
+                            /*
+                             * Start the VBoxVMI server if the VM config enables it.
+                             */
+                            rc = VMIR3Create(pUVM, &pUVM->vm.s.pvVMI);
+                            if (RT_SUCCESS(rc))
+                            {
+#endif
                             /*
                              * Now we can safely set the VM halt method to default.
                              */
@@ -681,6 +692,11 @@ static DECLCALLBACK(int) vmR3CreateU(PUVM pUVM, uint32_t cCpus, PFNCFGMCONSTRUCT
                                 vmR3SetState(pVM, VMSTATE_CREATED, VMSTATE_CREATING);
                                 return VINF_SUCCESS;
                             }
+#ifdef VBOX_WITH_VMI
+                            VMIR3Terminate(pUVM, pUVM->vm.s.pvVMI);
+                            pUVM->vm.s.pvVMI = NULL;
+                            }
+#endif
 #ifdef VBOX_WITH_DEBUGGER
                             DBGCIoTerminate(pUVM, pUVM->vm.s.pvDBGC);
                             pUVM->vm.s.pvDBGC = NULL;
@@ -2219,6 +2235,10 @@ DECLCALLBACK(int) vmR3Destroy(PVM pVM)
          */
         int rc = TMR3Term(pVM);
         AssertRC(rc);
+#ifdef VBOX_WITH_VMI
+        VMIR3Terminate(pUVM, pUVM->vm.s.pvVMI);
+        pUVM->vm.s.pvVMI = NULL;
+#endif
 #ifdef VBOX_WITH_DEBUGGER
         rc = DBGCIoTerminate(pUVM, pUVM->vm.s.pvDBGC);
         pUVM->vm.s.pvDBGC = NULL;
