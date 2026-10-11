@@ -4718,6 +4718,40 @@ VMMDECL(int) PGMPhysSimpleReadGCPhys(PVMCC pVM, void *pvDst, RTGCPHYS GCPhysSrc,
 
 
 /**
+ * Maps a guest page for PGMPhysSimpleWriteGCPhys, refusing MMIO pages.
+ *
+ * PGMPhysGCPhys2CCPtr maps special aliased MMIO pages (APIC access page) to the
+ * shared zero page, so writing thru such a mapping would modify every zero page
+ * in the VM.  Same check as pgmR3PhysGCPhys2CCPtrDelegated does.
+ *
+ * @returns VBox status code, see PGMPhysGCPhys2CCPtr.
+ * @param   pVM         The cross context VM structure.
+ * @param   GCPhys      The guest physical address of the page to map.
+ * @param   ppv         Where to store the address corresponding to GCPhys.
+ * @param   pLock       Where to store the lock information.
+ */
+static int pgmPhysSimpleWriteMapPage(PVMCC pVM, RTGCPHYS GCPhys, void **ppv, PPGMPAGEMAPLOCK pLock)
+{
+    int rc = PGM_LOCK(pVM);
+    AssertRCReturn(rc, rc);
+    rc = PGMPhysGCPhys2CCPtr(pVM, GCPhys, ppv, pLock);
+    if (RT_SUCCESS(rc))
+    {
+        PPGMPAGEMAPTLBE pTlbe;
+        int rc2 = pgmPhysPageQueryTlbe(pVM, GCPhys, &pTlbe);
+        AssertRC(rc2);
+        if (RT_FAILURE(rc2) || PGM_PAGE_IS_MMIO_OR_SPECIAL_ALIAS(pTlbe->pPage))
+        {
+            PGMPhysReleasePageMappingLock(pVM, pLock);
+            rc = VERR_PGM_PHYS_PAGE_RESERVED;
+        }
+    }
+    PGM_UNLOCK(pVM);
+    return rc;
+}
+
+
+/**
  * Write to guest physical memory referenced by GC pointer.
  * Write memory to GC physical address in guest physical memory.
  *
@@ -4742,7 +4776,7 @@ VMMDECL(int) PGMPhysSimpleWriteGCPhys(PVMCC pVM, RTGCPHYS GCPhysDst, const void 
     /* map the 1st page */
     void *pvDst;
     PGMPAGEMAPLOCK Lock;
-    int rc = PGMPhysGCPhys2CCPtr(pVM, GCPhysDst, &pvDst, &Lock);
+    int rc = pgmPhysSimpleWriteMapPage(pVM, GCPhysDst, &pvDst, &Lock);
     if (RT_FAILURE(rc))
         return rc;
 
@@ -4768,7 +4802,7 @@ VMMDECL(int) PGMPhysSimpleWriteGCPhys(PVMCC pVM, RTGCPHYS GCPhysDst, const void 
     for (;;)
     {
         /* map the page */
-        rc = PGMPhysGCPhys2CCPtr(pVM, GCPhysDst, &pvDst, &Lock);
+        rc = pgmPhysSimpleWriteMapPage(pVM, GCPhysDst, &pvDst, &Lock);
         if (RT_FAILURE(rc))
             return rc;
 
