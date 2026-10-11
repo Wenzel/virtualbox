@@ -294,11 +294,11 @@ static bool vmiR3HandleHello(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 /**
  * Handles a VMI_MSG_PHYS_READ request.
  *
- * Runs on the server thread: RAM, ROM and MMIO2 pages are mapped read-only
- * with PGMR3PhysGCPhys2CCPtrReadOnlyExternal, so there is no EMT round trip.
- * MMIO and special aliased MMIO pages (APIC access page) are refused by it,
- * and unassigned addresses fail the lookup: such pages get their status in
- * the reply and read as zeros, the device is never touched.
+ * Runs on the server thread.  The common all-RAM case is mapped under one PGM
+ * lock acquisition.  If that fails (for example, because the batch includes
+ * MMIO or an unassigned page), pages are mapped separately to retain a status
+ * for each page.  Neither read-only mapping API delegates to an EMT.  MMIO and
+ * special aliased MMIO pages are refused without touching the device.
  *
  * @returns false if the client must be disconnected.
  */
@@ -307,7 +307,7 @@ static bool vmiR3HandlePhysRead(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBo
     uint8_t const *pbRanges = (uint8_t const *)pHdr + sizeof(*pHdr);
     size_t const   cRanges  = cbBody / sizeof(VMIPHYSRANGE);
 
-    /* Validate and size the reply. */
+    /* Validate every range and size the reply before doing any PGM work. */
     int    rc     = cRanges && cbBody % sizeof(VMIPHYSRANGE) == 0 ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
     size_t cPages = 0;
     size_t cbData = 0;
@@ -330,35 +330,81 @@ static bool vmiR3HandlePhysRead(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBo
     if (RT_FAILURE(rc))
         return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
 
-    PVM       pVM    = pThis->pUVM->pVM;
-    uint8_t  *pbStat = pThis->abReply;
-    uint8_t  *pbData = &pThis->abReply[cPages * sizeof(int32_t)];
-    for (size_t i = 0; i < cRanges; i++)
+    PRTGCPHYS        paGCPhys  = (PRTGCPHYS)RTMemTmpAlloc(cPages * sizeof(*paGCPhys));
+    uint16_t         *pacbPages = (uint16_t *)RTMemTmpAlloc(cPages * sizeof(*pacbPages));
+    void const      **papvPages = (void const **)RTMemTmpAlloc(cPages * sizeof(*papvPages));
+    PPGMPAGEMAPLOCK  paLocks   = (PPGMPAGEMAPLOCK)RTMemTmpAlloc(cPages * sizeof(*paLocks));
+    if (!paGCPhys || !pacbPages || !papvPages || !paLocks)
+        rc = VERR_NO_TMP_MEMORY;
+
+    size_t iPage = 0;
+    for (size_t i = 0; i < cRanges && RT_SUCCESS(rc); i++)
     {
         VMIPHYSRANGE Range;
         memcpy(&Range, &pbRanges[i * sizeof(Range)], sizeof(Range));
         RTGCPHYS GCPhys = Range.GCPhys;
-        size_t   cbLeft = Range.cb;
+        size_t cbLeft = Range.cb;
         while (cbLeft)
         {
-            size_t const    cb = RT_MIN(cbLeft, GUEST_PAGE_SIZE - (GCPhys & GUEST_PAGE_OFFSET_MASK));
-            void const     *pvPage;
-            PGMPAGEMAPLOCK  Lock;
-            int32_t const   rcPage = PGMR3PhysGCPhys2CCPtrReadOnlyExternal(pVM, GCPhys, &pvPage, &Lock);
+            paGCPhys[iPage] = GCPhys;
+            size_t const cb = RT_MIN(cbLeft, GUEST_PAGE_SIZE - (GCPhys & GUEST_PAGE_OFFSET_MASK));
+            pacbPages[iPage++] = (uint16_t)cb;
+            GCPhys += cb;
+            cbLeft -= cb;
+        }
+    }
+
+    PVM      pVM    = pThis->pUVM->pVM;
+    uint8_t *pbStat = pThis->abReply;
+    uint8_t *pbData = &pThis->abReply[cPages * sizeof(int32_t)];
+    if (RT_SUCCESS(rc))
+        rc = PGMR3PhysBulkGCPhys2CCPtrReadOnlyExternal(pVM, (uint32_t)cPages, paGCPhys, papvPages, paLocks);
+    if (RT_SUCCESS(rc))
+    {
+        for (iPage = 0; iPage < cPages; iPage++)
+        {
+            size_t const cb = pacbPages[iPage];
+            int32_t const rcPage = VINF_SUCCESS; /* Normalize informational success statuses. */
+            memcpy(pbStat, &rcPage, sizeof(rcPage));
+            memcpy(pbData, papvPages[iPage], cb);
+            pbStat += sizeof(rcPage);
+            pbData += cb;
+        }
+        PGMPhysBulkReleasePageMappingLocks(pVM, (uint32_t)cPages, paLocks);
+    }
+    else if (rc != VERR_NO_TMP_MEMORY)
+    {
+        /* Bulk mapping releases its partial locks on failure.  Retry separately
+           only then, so one unreadable page does not fail the request. */
+        pbStat = pThis->abReply;
+        pbData = &pThis->abReply[cPages * sizeof(int32_t)];
+        for (iPage = 0; iPage < cPages; iPage++)
+        {
+            size_t const cb = pacbPages[iPage];
+            void const *pvPage;
+            PGMPAGEMAPLOCK Lock;
+            int32_t rcPage = PGMR3PhysGCPhys2CCPtrReadOnlyExternal(pVM, paGCPhys[iPage], &pvPage, &Lock);
             if (RT_SUCCESS(rcPage))
             {
                 memcpy(pbData, pvPage, cb);
                 PGMPhysReleasePageMappingLock(pVM, &Lock);
+                rcPage = VINF_SUCCESS;
             }
             else
                 memset(pbData, 0, cb);
             memcpy(pbStat, &rcPage, sizeof(rcPage));
             pbStat += sizeof(rcPage);
             pbData += cb;
-            GCPhys += cb;
-            cbLeft -= cb;
         }
+        rc = VINF_SUCCESS;
     }
+
+    RTMemTmpFree(paLocks);
+    RTMemTmpFree(papvPages);
+    RTMemTmpFree(pacbPages);
+    RTMemTmpFree(paGCPhys);
+    if (RT_FAILURE(rc))
+        return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VINF_SUCCESS,
                                 pThis->abReply, (size_t)(pbData - pThis->abReply)));
 }
