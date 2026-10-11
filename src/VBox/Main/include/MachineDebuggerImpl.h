@@ -143,6 +143,7 @@ private:
     bool i_queueSettings() const;
     HRESULT i_getEmExecPolicyProperty(EMEXECPOLICY enmPolicy, BOOL *pfEnforced);
     HRESULT i_setEmExecPolicyProperty(EMEXECPOLICY enmPolicy, BOOL fEnforce);
+    HRESULT i_accessMemory(VMCPUID idCpu, bool fPhysical, LONG64 aAddress, size_t cb, void *pvRead, const void *pvWrite);
 
     /** RTLogGetFlags, RTLogGetGroupSettings and RTLogGetDestinations function. */
     typedef DECLCALLBACKTYPE(int, FNLOGGETSTR,(PRTLOGGER, char *, size_t));
