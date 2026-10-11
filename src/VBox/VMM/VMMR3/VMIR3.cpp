@@ -52,8 +52,10 @@
 #include <iprt/dir.h>
 #include <iprt/mem.h>
 #include <iprt/path.h>
+#include <iprt/semaphore.h>
 #include <iprt/string.h>
 #include <iprt/thread.h>
+#include <iprt/time.h>
 
 #include <errno.h>
 #include <poll.h>
@@ -61,7 +63,21 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
+
+
+
+
+/*********************************************************************************************************************************
+*   Defined Constants And Macros                                                                                                 *
+*********************************************************************************************************************************/
+/** A client that doesn't read its replies for this long is dropped. */
+#define VMI_SEND_TIMEOUT_MS         5000
+/** How long VMIR3Terminate waits for the server thread (longer than a send). */
+#define VMI_TERM_TIMEOUT_MS         15000
+/** How long the server stops accepting after running out of file descriptors. */
+#define VMI_ACCEPT_BACKOFF_MS       1000
 
 
 /*********************************************************************************************************************************
@@ -78,12 +94,21 @@ typedef struct VMIR3
     RTTHREAD        hThread;
     /** The listening socket. */
     int             fdListen;
-    /** The connected client, -1 if none. */
+    /** Set once we bound the socket: only then is the file at pszPath ours. */
+    bool            fBound;
+    /** Device and inode of our socket file, so teardown never removes someone else's. */
+    dev_t           devSock;
+    ino_t           inoSock;
+    /** The connected client, -1 if none.  Changed by the server thread only,
+     *  under hMtxClient so that VMIR3Terminate can shut it down. */
     int             fdClient;
+    RTSEMFASTMUTEX  hMtxClient;
     /** Pipe for waking up the server thread on termination: [0] read, [1] write. */
     int             afdWakeup[2];
     /** Set when the client completed the handshake. */
     bool            fHandshaked;
+    /** RTTimeMilliTS until which accepting is suspended (out of descriptors). */
+    uint64_t        msAcceptResume;
     /** The socket path (heap). */
     char           *pszPath;
     /** Message buffer, sized so that larger messages are detected (MSG_TRUNC). */
@@ -96,7 +121,7 @@ typedef VMIR3 *PVMIR3;
 /**
  * Sends a message to a socket.
  *
- * @returns VBox status code.
+ * @returns VBox status code, VERR_TIMEOUT if the peer doesn't read.
  * @param   fd          The socket.
  * @param   idReq       The request ID (zero if not a reply).
  * @param   uType       The message type.
@@ -118,10 +143,21 @@ static int vmiR3Send(int fd, uint32_t idReq, uint16_t uType, uint16_t fFlags, in
     memcpy(abMsg, &Hdr, sizeof(Hdr));
     if (cbBody)
         memcpy(&abMsg[sizeof(Hdr)], pvBody, cbBody);
-    ssize_t cbSent = send(fd, abMsg, Hdr.cbMsg, MSG_NOSIGNAL);
+
+    ssize_t cbSent;
+    do
+        cbSent = send(fd, abMsg, Hdr.cbMsg, MSG_NOSIGNAL);
+    while (cbSent < 0 && errno == EINTR);
     if (cbSent == (ssize_t)Hdr.cbMsg)
         return VINF_SUCCESS;
-    return cbSent < 0 ? RTErrConvertFromErrno(errno) : VERR_NET_PROTOCOL_ERROR;
+    if (cbSent >= 0)
+        return VERR_NET_PROTOCOL_ERROR;
+    if (errno == EAGAIN) /* SO_SNDTIMEO expired (EWOULDBLOCK is the same on Linux) */
+    {
+        LogRel(("VMI: The client doesn't read its replies\n"));
+        return VERR_TIMEOUT;
+    }
+    return RTErrConvertFromErrno(errno);
 }
 
 
@@ -139,12 +175,17 @@ static int vmiR3SendHello(int fd, uint32_t idReq, uint16_t fFlags, int32_t rcMsg
 
 /**
  * Drops the connected client.
+ *
+ * This is where a client session ends, whatever the reason, so this is where
+ * the server will undo what the client did to the VM (resume, intercepts).
  */
 static void vmiR3Disconnect(PVMIR3 pThis)
 {
     LogRel(("VMI: Client disconnected\n"));
+    RTSemFastMutexRequest(pThis->hMtxClient);
     close(pThis->fdClient);
-    pThis->fdClient    = -1;
+    pThis->fdClient = -1;
+    RTSemFastMutexRelease(pThis->hMtxClient);
     pThis->fHandshaked = false;
 }
 
@@ -155,26 +196,43 @@ static void vmiR3Disconnect(PVMIR3 pThis)
  */
 static void vmiR3Accept(PVMIR3 pThis)
 {
-    int fd = accept4(pThis->fdListen, NULL, NULL, SOCK_CLOEXEC);
+    int fd;
+    do
+        fd = accept4(pThis->fdListen, NULL, NULL, SOCK_CLOEXEC);
+    while (fd < 0 && errno == EINTR);
     if (fd < 0)
     {
-        LogRel(("VMI: accept failed: errno=%d\n", errno));
+        int const iErr = errno;
+        /* The connection stays pending, so poll would report it again at once: back off. */
+        if (iErr == EMFILE || iErr == ENFILE || iErr == ENOBUFS || iErr == ENOMEM)
+            pThis->msAcceptResume = RTTimeMilliTS() + VMI_ACCEPT_BACKOFF_MS;
+        LogRelMax(32, ("VMI: accept failed: errno=%d\n", iErr));
         return;
     }
 
+    /* Bound every send, so a client that doesn't read cannot block the server. */
+    struct timeval Tv;
+    Tv.tv_sec  = VMI_SEND_TIMEOUT_MS / 1000;
+    Tv.tv_usec = (VMI_SEND_TIMEOUT_MS % 1000) * 1000;
     int rcGreeting = VINF_SUCCESS;
     struct ucred Cred;
+    RT_ZERO(Cred);
     socklen_t    cbCred = sizeof(Cred);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &Tv, sizeof(Tv)) != 0)
+    {
+        close(fd);
+        return;
+    }
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &Cred, &cbCred) != 0)
         rcGreeting = RTErrConvertFromErrno(errno);
     else if (Cred.uid != geteuid())
     {
-        LogRel(("VMI: Refused client pid %d: uid %u is not ours\n", Cred.pid, Cred.uid));
+        LogRelMax(32, ("VMI: Refused client pid %d: uid %u is not ours\n", Cred.pid, Cred.uid));
         rcGreeting = VERR_ACCESS_DENIED;
     }
     else if (pThis->fdClient >= 0)
     {
-        LogRel(("VMI: Refused client pid %d: another client is connected\n", Cred.pid));
+        LogRelMax(32, ("VMI: Refused client pid %d: another client is connected\n", Cred.pid));
         rcGreeting = VERR_RESOURCE_BUSY;
     }
 
@@ -182,7 +240,9 @@ static void vmiR3Accept(PVMIR3 pThis)
     if (RT_SUCCESS(rc) && RT_SUCCESS(rcGreeting))
     {
         LogRel(("VMI: Client pid %d connected\n", Cred.pid));
-        pThis->fdClient    = fd;
+        RTSemFastMutexRequest(pThis->hMtxClient);
+        pThis->fdClient = fd;
+        RTSemFastMutexRelease(pThis->hMtxClient);
         pThis->fHandshaked = false;
     }
     else
@@ -197,10 +257,13 @@ static void vmiR3Accept(PVMIR3 pThis)
  */
 static bool vmiR3HandleHello(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 {
-    if (cbBody != sizeof(VMIHELLO))
-        return false;
     if (pThis->fHandshaked)
         return RT_SUCCESS(vmiR3SendHello(pThis->fdClient, pHdr->idReq, VMI_MSG_F_REPLY, VERR_WRONG_ORDER));
+    if (cbBody != sizeof(VMIHELLO))
+    {
+        LogRel(("VMI: Protocol error: hello body of %zu bytes\n", cbBody));
+        return false;
+    }
 
     VMIHELLO Hello;
     memcpy(&Hello, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Hello));
@@ -225,7 +288,10 @@ static bool vmiR3HandleHello(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 static bool vmiR3HandleMsg(PVMIR3 pThis)
 {
     /* MSG_TRUNC makes recv return the real size of an oversized message. */
-    ssize_t cbMsg = recv(pThis->fdClient, pThis->abMsg, sizeof(pThis->abMsg), MSG_TRUNC);
+    ssize_t cbMsg;
+    do
+        cbMsg = recv(pThis->fdClient, pThis->abMsg, sizeof(pThis->abMsg), MSG_TRUNC);
+    while (cbMsg < 0 && errno == EINTR);
     if (cbMsg <= 0)
         return false; /* EOF or error */
 
@@ -268,17 +334,31 @@ static DECLCALLBACK(int) vmiR3Thread(RTTHREAD hThreadSelf, void *pvUser)
 
     for (;;)
     {
+        int cMsTimeout = -1;
+        bool fAccept = true;
+        if (pThis->msAcceptResume)
+        {
+            uint64_t const msNow = RTTimeMilliTS();
+            if (msNow < pThis->msAcceptResume)
+            {
+                fAccept    = false;
+                cMsTimeout = (int)(pThis->msAcceptResume - msNow);
+            }
+            else
+                pThis->msAcceptResume = 0;
+        }
+
         struct pollfd aFds[3];
         aFds[0].fd = pThis->afdWakeup[0];
-        aFds[1].fd = pThis->fdListen;
-        aFds[2].fd = pThis->fdClient; /* ignored by poll when -1 */
+        aFds[1].fd = fAccept ? pThis->fdListen : -1; /* poll ignores negative descriptors */
+        aFds[2].fd = pThis->fdClient;
         for (unsigned i = 0; i < RT_ELEMENTS(aFds); i++)
         {
             aFds[i].events  = POLLIN;
             aFds[i].revents = 0;
         }
 
-        int cReady = poll(aFds, RT_ELEMENTS(aFds), -1);
+        int cReady = poll(aFds, RT_ELEMENTS(aFds), cMsTimeout);
         if (cReady < 0)
         {
             if (errno == EINTR)
@@ -303,6 +383,68 @@ static DECLCALLBACK(int) vmiR3Thread(RTTHREAD hThreadSelf, void *pvUser)
 
 
 /**
+ * Checks that the socket's directory is private to us: owned by our euid, and
+ * not writable by others unless sticky.  Otherwise another user could replace
+ * the socket file under the client's feet.
+ */
+static int vmiR3CheckDir(PUVM pUVM, const char *pszDir)
+{
+    struct stat St;
+    if (stat(pszDir, &St) != 0)
+        return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS,
+                            "VMI: Cannot stat the socket directory \"%s\" (errno=%d)", pszDir, errno);
+    if (!S_ISDIR(St.st_mode))
+        return VMR3SetError(pUVM, VERR_NOT_A_DIRECTORY, RT_SRC_POS, "VMI: \"%s\" is not a directory", pszDir);
+    if (St.st_uid != geteuid())
+        return VMR3SetError(pUVM, VERR_ACCESS_DENIED, RT_SRC_POS,
+                            "VMI: The socket directory \"%s\" is owned by uid %u, not by the user running the VM",
+                            pszDir, St.st_uid);
+    if ((St.st_mode & (S_IWGRP | S_IWOTH)) && !(St.st_mode & S_ISVTX))
+        return VMR3SetError(pUVM, VERR_ACCESS_DENIED, RT_SRC_POS,
+                            "VMI: The socket directory \"%s\" is writable by group or others (mode %o)",
+                            pszDir, St.st_mode & 07777);
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Handles a socket file already at pThis->pszPath: removed if stale (nobody
+ * listening, e.g. left by a crashed VM process), an error otherwise.
+ */
+static int vmiR3RemoveStaleSocket(PVMIR3 pThis, struct sockaddr_un const *pAddr)
+{
+    PUVM pUVM = pThis->pUVM;
+    struct stat St;
+    if (lstat(pThis->pszPath, &St) != 0)
+        return VINF_SUCCESS;
+    if (!S_ISSOCK(St.st_mode))
+        return VMR3SetError(pUVM, VERR_ALREADY_EXISTS, RT_SRC_POS, "VMI: \"%s\" exists and is not a socket", pThis->pszPath);
+
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS, "VMI: socket failed (errno=%d)", errno);
+    int rcConnect;
+    do
+        rcConnect = connect(fd, (struct sockaddr const *)pAddr, sizeof(*pAddr));
+    while (rcConnect != 0 && errno == EINTR);
+    int const iErr = errno;
+    close(fd);
+    if (rcConnect == 0)
+        return VMR3SetError(pUVM, VERR_RESOURCE_IN_USE, RT_SRC_POS,
+                            "VMI: The socket \"%s\" is in use by another process (another VM with the same VMI/SocketPath?)",
+                            pThis->pszPath);
+    if (iErr != ECONNREFUSED)
+        return VMR3SetError(pUVM, RTErrConvertFromErrno(iErr), RT_SRC_POS,
+                            "VMI: Cannot tell whether the socket \"%s\" is in use (errno=%d)", pThis->pszPath, iErr);
+    LogRel(("VMI: Removing the stale socket %s\n", pThis->pszPath));
+    if (unlink(pThis->pszPath) != 0 && errno != ENOENT)
+        return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS,
+                            "VMI: Failed to remove the stale socket \"%s\" (errno=%d)", pThis->pszPath, errno);
+    return VINF_SUCCESS;
+}
+
+
+/**
  * Creates the listening socket at pThis->pszPath, mode 0600.
  *
  * @returns VBox status code, with the VM error set on failure.
@@ -317,6 +459,9 @@ static int vmiR3Listen(PVMIR3 pThis)
     if (RT_FAILURE(rc))
         return VMR3SetError(pUVM, VERR_FILENAME_TOO_LONG, RT_SRC_POS,
                             "VMI: The socket path \"%s\" is longer than %zu bytes", pThis->pszPath, sizeof(Addr.sun_path) - 1);
+    if (!RTPathStartsWithRoot(pThis->pszPath))
+        return VMR3SetError(pUVM, VERR_PATH_IS_RELATIVE, RT_SRC_POS, "VMI: The socket path \"%s\" is not absolute",
+                            pThis->pszPath);
 
     /* The default path's directory (<VBox user home>/vmi) may not exist yet. */
     char szDir[RTPATH_MAX];
@@ -325,27 +470,34 @@ static int vmiR3Listen(PVMIR3 pThis)
     rc = RTDirCreateFullPath(szDir, 0700);
     if (RT_FAILURE(rc))
         return VMR3SetError(pUVM, rc, RT_SRC_POS, "VMI: Failed to create the directory \"%s\"", szDir);
-
-    /* A socket left behind by a VM process that crashed would make bind fail; anything else is not ours to remove. */
-    struct stat St;
-    if (lstat(pThis->pszPath, &St) == 0)
-    {
-        if (!S_ISSOCK(St.st_mode))
-            return VMR3SetError(pUVM, VERR_ALREADY_EXISTS, RT_SRC_POS,
-                                "VMI: \"%s\" exists and is not a socket", pThis->pszPath);
-        unlink(pThis->pszPath);
-    }
+    rc = vmiR3CheckDir(pUVM, szDir);
+    if (RT_SUCCESS(rc))
+        rc = vmiR3RemoveStaleSocket(pThis, &Addr);
+    if (RT_FAILURE(rc))
+        return rc;
 
     pThis->fdListen = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (pThis->fdListen < 0)
         return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS, "VMI: socket failed (errno=%d)", errno);
+    /* Linux creates the socket file with the socket inode's mode (minus the umask),
+       so the file is 0600 (or stricter) from the start, no chmod by path. */
+    if (fchmod(pThis->fdListen, 0600) != 0)
+        return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS, "VMI: fchmod failed (errno=%d)", errno);
     if (bind(pThis->fdListen, (struct sockaddr *)&Addr, sizeof(Addr)) != 0)
         return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS,
                             "VMI: Failed to bind \"%s\" (errno=%d)", pThis->pszPath, errno);
-    /* Before listen, so nobody can connect while the umask derived mode is in effect. */
-    if (chmod(pThis->pszPath, 0600) != 0)
+    pThis->fBound = true;
+
+    struct stat St;
+    if (lstat(pThis->pszPath, &St) != 0)
         return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS,
-                            "VMI: Failed to chmod \"%s\" (errno=%d)", pThis->pszPath, errno);
+                            "VMI: Cannot stat \"%s\" after bind (errno=%d)", pThis->pszPath, errno);
+    pThis->devSock = St.st_dev;
+    pThis->inoSock = St.st_ino;
+    if (St.st_mode & 077)
+        return VMR3SetError(pUVM, VERR_ACCESS_DENIED, RT_SRC_POS,
+                            "VMI: The socket \"%s\" was created with mode %o instead of 0600", pThis->pszPath, St.st_mode & 0777);
+
     if (listen(pThis->fdListen, 1) != 0)
         return VMR3SetError(pUVM, RTErrConvertFromErrno(errno), RT_SRC_POS,
                             "VMI: Failed to listen on \"%s\" (errno=%d)", pThis->pszPath, errno);
@@ -382,6 +534,7 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     pThis->hThread      = NIL_RTTHREAD;
     pThis->fdListen     = -1;
     pThis->fdClient     = -1;
+    pThis->hMtxClient   = NIL_RTSEMFASTMUTEX;
     pThis->afdWakeup[0] = -1;
     pThis->afdWakeup[1] = -1;
 
@@ -389,6 +542,8 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     rc = CFGMR3QueryStringAlloc(pCfg, "SocketPath", &pThis->pszPath);
     if (RT_FAILURE(rc))
         rc = VM_SET_ERROR_U(pUVM, rc, "Configuration error: Failed querying \"VMI/SocketPath\"");
+    if (RT_SUCCESS(rc))
+        rc = RTSemFastMutexCreate(&pThis->hMtxClient);
     if (RT_SUCCESS(rc))
         rc = vmiR3Listen(pThis);
     if (RT_SUCCESS(rc) && pipe2(pThis->afdWakeup, O_CLOEXEC) != 0)
@@ -403,6 +558,7 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
             *ppvVmi = pThis;
             return VINF_SUCCESS;
         }
+        pThis->hThread = NIL_RTTHREAD;
         rc = VM_SET_ERROR_U(pUVM, rc, "VMI: Failed to create the server thread");
     }
 
@@ -413,6 +569,10 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
 
 /**
  * Stops the VBoxVMI server, disconnecting the client and removing the socket.
+ *
+ * Called by VMR3Destroy before the EMTs stop serving requests, so the server
+ * thread can still finish a request it routed to an EMT.  Never waits for the
+ * thread indefinitely.
  *
  * @param   pUVM        The user mode VM handle.
  * @param   pvVmi       The server instance from VMIR3Create, NULL is fine.
@@ -427,19 +587,42 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
     if (pThis->hThread != NIL_RTTHREAD)
     {
         char ch = 0;
-        ssize_t cbIgn = write(pThis->afdWakeup[1], &ch, 1); RT_NOREF(cbIgn);
-        int rc = RTThreadWait(pThis->hThread, RT_INDEFINITE_WAIT, NULL);
-        AssertLogRelRC(rc);
+        ssize_t cbWritten;
+        do
+            cbWritten = write(pThis->afdWakeup[1], &ch, 1);
+        while (cbWritten < 0 && errno == EINTR);
+
+        /* Unblock a send to or recv from the client. */
+        RTSemFastMutexRequest(pThis->hMtxClient);
+        if (pThis->fdClient >= 0)
+            shutdown(pThis->fdClient, SHUT_RDWR);
+        RTSemFastMutexRelease(pThis->hMtxClient);
+
+        int rc = RTThreadWait(pThis->hThread, VMI_TERM_TIMEOUT_MS, NULL);
+        if (RT_FAILURE(rc))
+        {
+            /* The thread still uses the instance: leak it rather than hang the VM teardown. */
+            LogRel(("VMI: The server thread did not stop (%Rrc), abandoning it\n", rc));
+            return;
+        }
     }
     if (pThis->fdListen >= 0)
-    {
         close(pThis->fdListen);
-        unlink(pThis->pszPath);
+    if (pThis->fBound)
+    {
+        /* Only if the file is still the one we bound. */
+        struct stat St;
+        if (   lstat(pThis->pszPath, &St) == 0
+            && S_ISSOCK(St.st_mode)
+            && St.st_dev == pThis->devSock
+            && St.st_ino == pThis->inoSock)
+            unlink(pThis->pszPath);
     }
     if (pThis->afdWakeup[0] >= 0)
         close(pThis->afdWakeup[0]);
     if (pThis->afdWakeup[1] >= 0)
         close(pThis->afdWakeup[1]);
+    RTSemFastMutexDestroy(pThis->hMtxClient);
     MMR3HeapFree(pThis->pszPath);
     RTMemFree(pThis);
 }

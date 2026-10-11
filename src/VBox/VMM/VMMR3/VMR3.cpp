@@ -2177,6 +2177,15 @@ VMMR3DECL(int) VMR3Destroy(PUVM pUVM)
     if (RT_FAILURE(rc))
         return rc;
 
+#ifdef VBOX_WITH_VMI
+    /*
+     * Stop the VBoxVMI server while the EMTs still serve requests: its
+     * thread may be waiting for one, and its disconnect cleanup uses them.
+     */
+    VMIR3Terminate(pUVM, pUVM->vm.s.pvVMI);
+    pUVM->vm.s.pvVMI = NULL;
+#endif
+
     rc = VMR3ReqCallWait(pVM, VMCPUID_ALL_REVERSE, (PFNRT)vmR3Destroy, 1, pVM);
     AssertLogRelRC(rc);
 
@@ -2236,6 +2245,7 @@ DECLCALLBACK(int) vmR3Destroy(PVM pVM)
         int rc = TMR3Term(pVM);
         AssertRC(rc);
 #ifdef VBOX_WITH_VMI
+        /* Normally done by VMR3Destroy already. */
         VMIR3Terminate(pUVM, pUVM->vm.s.pvVMI);
         pUVM->vm.s.pvVMI = NULL;
 #endif
