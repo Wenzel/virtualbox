@@ -25193,6 +25193,12 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
     <method name="getRegisters">
       <desc>
         Gets all the registers for the given CPU.
+
+        Currently @a cpuId is ignored: the registers of all virtual CPUs are
+        returned, their names prefixed with the CPU set (cpu0., cpu1., ...),
+        followed by the device registers.  The virtual CPUs are queried
+        together in one rendezvous, so their registers are consistent with
+        each other.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25210,10 +25216,23 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="setRegister">
       <desc>
-        Gets one register.
+        Sets one register.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The register is written by the virtual CPU on its own thread, so on
+        a running VM the write waits until the virtual CPU is available and
+        takes effect when the guest resumes execution there.  Segment
+        selectors and their hidden base, limit and attribute fields are raw
+        debugger state: changing a selector does not load a descriptor, so
+        callers that need a complete segment update must set the hidden fields
+        too.  A value wider than the register is truncated.
+
+        Fails with E_INVALIDARG if the value cannot be parsed, with E_FAIL if
+        @a cpuId is not a valid virtual CPU or the register was not found,
+        with VBOX_E_VM_ERROR, carrying the VBox status code, if the register
+        is read-only (VERR_DBGF_READ_ONLY_REGISTER), cannot be set
+        (VERR_NOT_IMPLEMENTED) or refuses the value (e.g.
+        VERR_CPUM_RAISE_GP_0 for an invalid MSR value), and with
+        E_ACCESSDENIED if the VM is powered off.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25223,19 +25242,27 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       </param>
       <param name="value" type="wstring" dir="in">
         <desc>
-          The new register value. Hexadecimal, decimal and octal formats
-          are supported in addition to any special formats returned by
-          the getters.
+          The new register value: an integer of up to 64 bits, hexadecimal
+          (0x prefixed), octal (0 prefixed) or decimal, or for the descriptor
+          table registers (gdtr, idtr) the base:limit format returned by the
+          getters.  Floating point and registers wider than 64 bits cannot
+          be set with this format.
         </desc>
       </param>
     </method>
 
     <method name="setRegisters">
       <desc>
-        Sets zero or more registers atomically.
+        Sets zero or more registers.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        All the values are parsed before any register is written.  The
+        registers are then written in order, each one like
+        <link to="#setRegister"/> does, stopping at the first failure, which
+        is reported like for <link to="#setRegister"/>: the registers before
+        the failing one stay written.  On a running VM the registers are not
+        written all at once; pause the VM for a consistent update.
+
+        Fails with E_INVALIDARG if the arrays differ in size.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
