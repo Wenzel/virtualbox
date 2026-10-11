@@ -66,6 +66,13 @@ RT_C_DECLS_BEGIN
 /** Handshake: unsolicited greeting from the server, then client request and
  *  server reply.  Body: VMIHELLO. */
 #define VMI_MSG_HELLO               UINT16_C(0x0001)
+/** Read guest physical memory.  Request body: an array of VMIPHYSRANGE.
+ *  Reply body: an int32_t VBox status per guest page each range overlaps (in
+ *  request order), then the bytes of every range (in request order). */
+#define VMI_MSG_PHYS_READ           UINT16_C(0x0002)
+/** Get the guest RAM ranges.  Request body: empty.
+ *  Reply body: an array of VMIRAMRANGE sorted by address. */
+#define VMI_MSG_RAM_RANGES          UINT16_C(0x0003)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -105,6 +112,32 @@ typedef struct VMIHELLO
     uint32_t    u32Version;
 } VMIHELLO;
 AssertCompileSize(VMIHELLO, 8);
+
+/**
+ * A guest physical memory range in a VMI_MSG_PHYS_READ request.
+ */
+typedef struct VMIPHYSRANGE
+{
+    /** The guest physical address of the first byte. */
+    uint64_t    GCPhys;
+    /** The number of bytes, nonzero.  The range must not wrap around. */
+    uint32_t    cb;
+    /** Reserved, zero. */
+    uint32_t    u32Reserved;
+} VMIPHYSRANGE;
+AssertCompileSize(VMIPHYSRANGE, 16);
+
+/**
+ * A guest RAM range in a VMI_MSG_RAM_RANGES reply.
+ */
+typedef struct VMIRAMRANGE
+{
+    /** The guest physical address of the first byte. */
+    uint64_t    GCPhysFirst;
+    /** The guest physical address of the last byte. */
+    uint64_t    GCPhysLast;
+} VMIRAMRANGE;
+AssertCompileSize(VMIRAMRANGE, 16);
 
 #ifdef IN_RING3
 VMMR3_INT_DECL(int)  VMIR3Create(PUVM pUVM, void **ppvVmi);

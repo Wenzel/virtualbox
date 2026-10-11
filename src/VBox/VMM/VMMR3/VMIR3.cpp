@@ -44,6 +44,7 @@
 #include <VBox/vmm/vmi.h>
 #include <VBox/vmm/cfgm.h>
 #include <VBox/vmm/mm.h>
+#include <VBox/vmm/pgm.h>
 #include <VBox/vmm/vm.h>
 #include <VBox/vmm/uvm.h>
 #include <VBox/err.h>
@@ -64,6 +65,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 
 
@@ -113,6 +115,8 @@ typedef struct VMIR3
     char           *pszPath;
     /** Message buffer, sized so that larger messages are detected (MSG_TRUNC). */
     uint8_t         abMsg[VMI_MSG_SIZE_MAX];
+    /** Reply body buffer. */
+    uint8_t         abReply[VMI_MSG_SIZE_MAX - sizeof(VMIMSGHDR)];
 } VMIR3;
 /** Pointer to the VBoxVMI server instance. */
 typedef VMIR3 *PVMIR3;
@@ -132,21 +136,28 @@ typedef VMIR3 *PVMIR3;
  */
 static int vmiR3Send(int fd, uint32_t idReq, uint16_t uType, uint16_t fFlags, int32_t rcMsg, void const *pvBody, size_t cbBody)
 {
-    uint8_t   abMsg[sizeof(VMIMSGHDR) + sizeof(VMIHELLO)];
-    AssertReturn(cbBody <= sizeof(abMsg) - sizeof(VMIMSGHDR), VERR_BUFFER_OVERFLOW);
+    AssertReturn(cbBody <= VMI_MSG_SIZE_MAX - sizeof(VMIMSGHDR), VERR_BUFFER_OVERFLOW);
     VMIMSGHDR Hdr;
     Hdr.cbMsg  = (uint32_t)(sizeof(Hdr) + cbBody);
     Hdr.idReq  = idReq;
     Hdr.uType  = uType;
     Hdr.fFlags = fFlags;
     Hdr.rc     = rcMsg;
-    memcpy(abMsg, &Hdr, sizeof(Hdr));
-    if (cbBody)
-        memcpy(&abMsg[sizeof(Hdr)], pvBody, cbBody);
+
+    /* Header and body as one record, without copying them together. */
+    struct iovec aIov[2];
+    aIov[0].iov_base = &Hdr;
+    aIov[0].iov_len  = sizeof(Hdr);
+    aIov[1].iov_base = (void *)pvBody;
+    aIov[1].iov_len  = cbBody;
+    struct msghdr Msg;
+    RT_ZERO(Msg);
+    Msg.msg_iov    = aIov;
+    Msg.msg_iovlen = RT_ELEMENTS(aIov);
 
     ssize_t cbSent;
     do
-        cbSent = send(fd, abMsg, Hdr.cbMsg, MSG_NOSIGNAL);
+        cbSent = sendmsg(fd, &Msg, MSG_NOSIGNAL);
     while (cbSent < 0 && errno == EINTR);
     if (cbSent == (ssize_t)Hdr.cbMsg)
         return VINF_SUCCESS;
@@ -281,6 +292,115 @@ static bool vmiR3HandleHello(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 
 
 /**
+ * Handles a VMI_MSG_PHYS_READ request.
+ *
+ * Runs on the server thread: RAM, ROM and MMIO2 pages are mapped read-only
+ * with PGMR3PhysGCPhys2CCPtrReadOnlyExternal, so there is no EMT round trip.
+ * MMIO and special aliased MMIO pages (APIC access page) are refused by it,
+ * and unassigned addresses fail the lookup: such pages get their status in
+ * the reply and read as zeros, the device is never touched.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandlePhysRead(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    uint8_t const *pbRanges = (uint8_t const *)pHdr + sizeof(*pHdr);
+    size_t const   cRanges  = cbBody / sizeof(VMIPHYSRANGE);
+
+    /* Validate and size the reply. */
+    int    rc     = cRanges && cbBody % sizeof(VMIPHYSRANGE) == 0 ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
+    size_t cPages = 0;
+    size_t cbData = 0;
+    for (size_t i = 0; i < cRanges && RT_SUCCESS(rc); i++)
+    {
+        VMIPHYSRANGE Range;
+        memcpy(&Range, &pbRanges[i * sizeof(Range)], sizeof(Range));
+        if (   !Range.cb
+            || Range.u32Reserved
+            || Range.GCPhys + Range.cb - 1 < Range.GCPhys)
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            cPages += ((Range.GCPhys + Range.cb - 1) >> GUEST_PAGE_SHIFT) - (Range.GCPhys >> GUEST_PAGE_SHIFT) + 1;
+            cbData += Range.cb;
+        }
+    }
+    if (RT_SUCCESS(rc) && cPages * sizeof(int32_t) + cbData > sizeof(pThis->abReply))
+        rc = VERR_BUFFER_OVERFLOW;
+    if (RT_FAILURE(rc))
+        return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
+
+    PVM       pVM    = pThis->pUVM->pVM;
+    uint8_t  *pbStat = pThis->abReply;
+    uint8_t  *pbData = &pThis->abReply[cPages * sizeof(int32_t)];
+    for (size_t i = 0; i < cRanges; i++)
+    {
+        VMIPHYSRANGE Range;
+        memcpy(&Range, &pbRanges[i * sizeof(Range)], sizeof(Range));
+        RTGCPHYS GCPhys = Range.GCPhys;
+        size_t   cbLeft = Range.cb;
+        while (cbLeft)
+        {
+            size_t const    cb = RT_MIN(cbLeft, GUEST_PAGE_SIZE - (GCPhys & GUEST_PAGE_OFFSET_MASK));
+            void const     *pvPage;
+            PGMPAGEMAPLOCK  Lock;
+            int32_t const   rcPage = PGMR3PhysGCPhys2CCPtrReadOnlyExternal(pVM, GCPhys, &pvPage, &Lock);
+            if (RT_SUCCESS(rcPage))
+            {
+                memcpy(pbData, pvPage, cb);
+                PGMPhysReleasePageMappingLock(pVM, &Lock);
+            }
+            else
+                memset(pbData, 0, cb);
+            memcpy(pbStat, &rcPage, sizeof(rcPage));
+            pbStat += sizeof(rcPage);
+            pbData += cb;
+            GCPhys += cb;
+            cbLeft -= cb;
+        }
+    }
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VINF_SUCCESS,
+                                pThis->abReply, (size_t)(pbData - pThis->abReply)));
+}
+
+
+/**
+ * Handles a VMI_MSG_RAM_RANGES request: the PGM RAM ranges that are not ad hoc
+ * (ROM, MMIO, MMIO2), contiguous ones merged, sorted by address.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandleRamRanges(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    uint32_t const cMax   = sizeof(pThis->abReply) / sizeof(VMIRAMRANGE);
+    size_t   const cbList = RT_UOFFSETOF_DYN(PGMPHYSRANGES, aRanges[cMax]);
+    PPGMPHYSRANGES pList  = NULL;
+    size_t         cbReply = 0;
+    int rc = cbBody ? VERR_INVALID_PARAMETER : VINF_SUCCESS;
+    if (RT_SUCCESS(rc))
+    {
+        pList = (PPGMPHYSRANGES)RTMemTmpAlloc(cbList);
+        rc = pList ? PGMR3PhysGetRamBootZeroedRanges(pThis->pUVM->pVM, pList, cMax) : VERR_NO_TMP_MEMORY;
+    }
+    if (RT_SUCCESS(rc))
+    {
+        /* PGM lists them from the highest address down. */
+        for (uint64_t i = 0; i < pList->cRanges; i++)
+        {
+            PGMPHYSRANGE const *pSrc = &pList->aRanges[pList->cRanges - 1 - i];
+            VMIRAMRANGE Range;
+            Range.GCPhysFirst = pSrc->GCPhysStart;
+            Range.GCPhysLast  = pSrc->GCPhysStart + (pSrc->cPages << GUEST_PAGE_SHIFT) - 1;
+            memcpy(&pThis->abReply[i * sizeof(Range)], &Range, sizeof(Range));
+        }
+        cbReply = pList->cRanges * sizeof(VMIRAMRANGE);
+    }
+    RTMemTmpFree(pList);
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, pThis->abReply, cbReply));
+}
+
+
+/**
  * Receives and handles one message from the client.
  *
  * @returns false if the client must be disconnected.
@@ -319,6 +439,15 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
     {
         vmiR3Send(pThis->fdClient, Hdr.idReq, Hdr.uType, VMI_MSG_F_REPLY, VERR_WRONG_ORDER, NULL, 0);
         return false;
+    }
+    switch (Hdr.uType)
+    {
+        case VMI_MSG_PHYS_READ:
+            return vmiR3HandlePhysRead(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_RAM_RANGES:
+            return vmiR3HandleRamRanges(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        default:
+            break;
     }
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, Hdr.idReq, Hdr.uType, VMI_MSG_F_REPLY, VERR_NOT_SUPPORTED, NULL, 0));
 }
