@@ -455,6 +455,7 @@
     <topicref href="topics/collect-debug-info.dita">
          <topicref href="topics/ts_vboxbugreport.dita"/>
          <topicref href="topics/ts_debugger.dita"/>
+         <topicref href="topics/ts_vmi.dita"/>
          <topicref href="topics/ts_guest-core-format.dita"/>
     </topicref>
     <topicref href="topics/ts_legacy-os.dita">
