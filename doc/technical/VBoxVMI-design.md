@@ -20,7 +20,15 @@ how the server is built and why. The wire protocol is in `VBoxVMI-protocol.md`.
 ## Lifetime and configuration
 
 - Started in `vmR3CreateU` right after the TCP debugger console
-  (`DBGCIoCreate`), and stopped in `vmR3Destroy` next to it.
+  (`DBGCIoCreate`).
+- Stopped in `VMR3Destroy`, on the caller's (non-EMT) thread, right after the
+  state changes to Destroying and before the destroy request goes to the
+  EMTs. The VM is already off, but the EMTs still serve requests, so a server
+  thread waiting for an EMT (registers, pause/resume) gets its answer and
+  the disconnect cleanup can still use the EMTs. The later `vmR3Destroy` on
+  EMT(0), where the debugger console stops, only covers paths that bypass
+  `VMR3Destroy`. A state-change callback on power off was not used: it runs
+  on an EMT, which a server thread could be waiting for.
 - CFGM node `VMI`, set through extradata `VBoxInternal/VMI/...`:
   - `Enabled` (bool, default false). Off unless enabled per VM.
   - `SocketPath` (string). Main (`Console::i_configGuestDbg`) inserts the
@@ -28,16 +36,30 @@ how the server is built and why. The wire protocol is in `VBoxVMI-protocol.md`.
   - Unknown values under `VMI` fail VM start, so that a typo such as
     `VBoxInternal/VMI/Enable` is not silently ignored.
 - If VBoxVMI is enabled but the socket cannot be created, the VM fails to start
-  with an error naming the path: the user asked for it explicitly. The parent
-  directory is created with mode 0700 if missing. A socket left at the path by
-  a crashed VM process is replaced; any other file there is an error.
-- The socket is removed when the VM is destroyed.
+  with an error naming the path: the user asked for it explicitly. The path
+  must be absolute; its directory is created with mode 0700 if missing.
+- A socket already at the path is probed with `connect`: only
+  `ECONNREFUSED` (nobody listening, e.g. left by a crashed VM process) makes
+  it stale, and it is replaced. A live socket (another VM with the same path)
+  or any other file is an error, and is left alone.
+- The socket is removed when the VM is destroyed, only if we bound it and the
+  file at the path still has the device and inode recorded after `bind`.
 
 ## Threading
 
 One server thread (`VMI`) owned by the module polls a wakeup pipe, the
-listening socket and the connected client. Termination writes to the pipe and
-waits for the thread, which disconnects the client.
+listening socket and the connected client. Termination writes to the pipe,
+shuts the client socket down (unblocking a send or receive) and waits for the
+thread, which disconnects the client. The wait is bounded (15 s); if the
+thread does not stop, it is abandoned with its instance data rather than
+hanging the VM teardown.
+
+- Every send to a client has a 5 s timeout (`SO_SNDTIMEO`): a client that
+  stops reading its replies is dropped instead of blocking the server.
+- If `accept` fails for lack of file descriptors or memory, the pending
+  connection would wake `poll` again at once, so the server stops polling the
+  listening socket for 1 s. Accept errors are logged at most 32 times.
+- System calls interrupted by signals (`EINTR`) are retried.
 
 Later commands are planned as follows:
 
@@ -50,9 +72,14 @@ Later commands are planned as follows:
 
 ## Security
 
-- The socket is created with mode 0600 (chmod between `bind` and `listen`, so
-  nobody can connect while the umask-derived mode applies) and the default
-  directory is 0700.
+- The socket file is 0600 from its creation: Linux creates it with the mode
+  of the socket inode (minus the umask), which `fchmod` sets before `bind`.
+  There is no chmod by path. The mode is checked after `bind`.
+- The socket's directory must be owned by the VM process' effective uid and
+  not writable by group or others unless sticky; otherwise the VM fails to
+  start. Another user could otherwise replace the socket file. This rules out
+  e.g. `/tmp` itself (root-owned) but allows a private directory anywhere.
+  The default directory is created 0700.
 - The server checks the peer's uid with `SO_PEERCRED` and refuses any uid but
   the VM process' effective uid, root included. Root can still introspect the
   VM by other means; refusing it keeps the rule simple.
