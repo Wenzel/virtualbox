@@ -15,6 +15,10 @@ are in `include/VBox/vmm/vmi.h`; a Rust client is `vboxvmi`
   (the user home is `VBOX_USER_HOME` or the per-user VirtualBox config directory).
 - The socket is mode 0600 and the server only serves peers running under the
   VM process' effective uid (`SO_PEERCRED`).
+- The socket's directory must be owned by that uid and not writable by group
+  or others (unless sticky), and the path must be absolute.
+- A client must read its replies: a reply the server cannot send within 5 s
+  gets the client disconnected.
 - One client at a time. The server greets a refused connection with an error
   status (see Handshake) and closes it.
 
@@ -71,7 +75,7 @@ the connection stays up.
 
 Any other request before a successful handshake is answered with
 `VERR_WRONG_ORDER` (-22) and the server closes. A second hello after the
-handshake is answered with `VERR_WRONG_ORDER` and the connection stays up.
+handshake, whatever its body, is answered with `VERR_WRONG_ORDER` and the connection stays up.
 
 ## Disconnecting
 
