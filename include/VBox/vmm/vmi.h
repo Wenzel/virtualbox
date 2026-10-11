@@ -1,0 +1,118 @@
+/** @file
+ * VMI - VBoxVMI, the virtual machine introspection server.
+ *
+ * Wire format of the VBoxVMI protocol, see doc/technical/VBoxVMI-protocol.md.
+ */
+
+/*
+ * Copyright (C) 2026 Oracle and/or its affiliates.
+ *
+ * This file is part of VirtualBox base platform packages, as
+ * available from https://www.virtualbox.org.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation, in version 3 of the
+ * License.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <https://www.gnu.org/licenses>.
+ *
+ * The contents of this file may alternatively be used under the terms
+ * of the Common Development and Distribution License Version 1.0
+ * (CDDL), a copy of it is provided in the "COPYING.CDDL" file included
+ * in the VirtualBox distribution, in which case the provisions of the
+ * CDDL are applicable instead of those of the GPL.
+ *
+ * You may elect to license modified versions of this file under the
+ * terms and conditions of either the GPL or the CDDL or both.
+ *
+ * SPDX-License-Identifier: GPL-3.0-only OR CDDL-1.0
+ */
+
+#ifndef VBOX_INCLUDED_vmm_vmi_h
+#define VBOX_INCLUDED_vmm_vmi_h
+#ifndef RT_WITHOUT_PRAGMA_ONCE
+# pragma once
+#endif
+
+#include <VBox/types.h>
+#include <iprt/assertcompile.h>
+
+RT_C_DECLS_BEGIN
+
+/** @defgroup grp_vmi   VBoxVMI - Virtual Machine Introspection Server
+ * @ingroup grp_vmm
+ *
+ * All integers on the wire are little endian.  Every message is one
+ * SOCK_SEQPACKET record: a VMIMSGHDR followed by the type specific body.
+ * @{
+ */
+
+/** Protocol magic, the bytes "BVMI" on the wire. */
+#define VMI_MAGIC                   UINT32_C(0x494d5642)
+/** Protocol version.  Client and server must match exactly. */
+#define VMI_VERSION                 UINT32_C(1)
+/** Maximum size of a message, header included. */
+#define VMI_MSG_SIZE_MAX            _64K
+
+/** @name Message types (VMIMSGHDR::uType)
+ * @{ */
+/** Handshake: unsolicited greeting from the server, then client request and
+ *  server reply.  Body: VMIHELLO. */
+#define VMI_MSG_HELLO               UINT16_C(0x0001)
+/** @} */
+
+/** @name Message flags (VMIMSGHDR::fFlags)
+ * @{ */
+/** The message is the reply to the request with the same VMIMSGHDR::idReq. */
+#define VMI_MSG_F_REPLY             UINT16_C(0x0001)
+/** @} */
+
+/**
+ * Message header.
+ */
+typedef struct VMIMSGHDR
+{
+    /** Size of the message in bytes, header included. */
+    uint32_t    cbMsg;
+    /** Request ID chosen by the client and echoed in the reply.
+     *  Zero in messages that are not replies. */
+    uint32_t    idReq;
+    /** Message type, VMI_MSG_XXX. */
+    uint16_t    uType;
+    /** Flags, VMI_MSG_F_XXX. */
+    uint16_t    fFlags;
+    /** VBox status code: the result in replies and in the greeting, zero
+     *  in requests. */
+    int32_t     rc;
+} VMIMSGHDR;
+AssertCompileSize(VMIMSGHDR, 16);
+
+/**
+ * Body of the VMI_MSG_HELLO messages.
+ */
+typedef struct VMIHELLO
+{
+    /** VMI_MAGIC. */
+    uint32_t    u32Magic;
+    /** VMI_VERSION of the sender. */
+    uint32_t    u32Version;
+} VMIHELLO;
+AssertCompileSize(VMIHELLO, 8);
+
+#ifdef IN_RING3
+VMMR3_INT_DECL(int)  VMIR3Create(PUVM pUVM, void **ppvVmi);
+VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi);
+#endif
+
+/** @} */
+
+RT_C_DECLS_END
+
+#endif /* !VBOX_INCLUDED_vmm_vmi_h */
