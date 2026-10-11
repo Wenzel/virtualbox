@@ -920,16 +920,67 @@ HRESULT MachineDebugger::modifyLogDestinations(const com::Utf8Str &aSettings)
     return hrc;
 }
 
+/**
+ * Worker for the read/write physical/virtual memory methods.
+ *
+ * Uses the debugger memory API, which does the access on the EMT of @a idCpu
+ * and bypasses MMIO and access handlers, so it never has device side effects.
+ * The access is split into chunks so the EMT is not held up by big requests.
+ *
+ * @returns COM status code.
+ * @param   idCpu       The virtual CPU the address is relative to.  Only
+ *                      matters for virtual addresses, pass 0 for physical.
+ * @param   fPhysical   Whether @a aAddress is a guest physical (true) or a
+ *                      guest virtual (false) address.
+ * @param   aAddress    The guest address.
+ * @param   cb          The number of bytes to read or write.
+ * @param   pvRead      The buffer to read into, NULL when writing.
+ * @param   pvWrite     The bytes to write, NULL when reading.
+ */
+HRESULT MachineDebugger::i_accessMemory(VMCPUID idCpu, bool fPhysical, LONG64 aAddress, size_t cb,
+                                        void *pvRead, const void *pvWrite)
+{
+    AutoWriteLock alock(this COMMA_LOCKVAL_SRC_POS);
+    Console::SafeVMPtr ptrVM(mParent);
+    HRESULT hrc = ptrVM.hrc();
+    if (SUCCEEDED(hrc))
+    {
+        PCVMMR3VTABLE const pVMM = ptrVM.vtable();
+        for (size_t off = 0; off < cb; off += _64K)
+        {
+            size_t const cbChunk = RT_MIN(cb - off, _64K);
+            DBGFADDRESS  Addr;
+            if (fPhysical)
+                pVMM->pfnDBGFR3AddrFromPhys(ptrVM.rawUVM(), &Addr, (RTGCPHYS)aAddress + off);
+            else
+                pVMM->pfnDBGFR3AddrFromFlat(ptrVM.rawUVM(), &Addr, (RTGCUINTPTR)aAddress + off);
+
+            int vrc;
+            if (pvWrite)
+                vrc = pVMM->pfnDBGFR3MemWrite(ptrVM.rawUVM(), idCpu, &Addr, (uint8_t const *)pvWrite + off, cbChunk);
+            else
+                vrc = pVMM->pfnDBGFR3MemRead(ptrVM.rawUVM(), idCpu, &Addr, (uint8_t *)pvRead + off, cbChunk);
+            if (RT_FAILURE(vrc))
+                return setErrorBoth(VBOX_E_VM_ERROR, vrc,
+                                    pvWrite ? tr("Writing %zu bytes to guest %s address %#RX64 failed: %Rrc")
+                                            : tr("Reading %zu bytes from guest %s address %#RX64 failed: %Rrc"),
+                                    cbChunk, fPhysical ? "physical" : "virtual", aAddress + (LONG64)off, vrc);
+        }
+    }
+    return hrc;
+}
+
 HRESULT MachineDebugger::readPhysicalMemory(LONG64 aAddress, ULONG aSize, std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    aBytes.resize(aSize);
+    return i_accessMemory(0 /*idCpu*/, true /*fPhysical*/, aAddress, aSize, aBytes.data(), NULL);
 }
 
 HRESULT MachineDebugger::writePhysicalMemory(LONG64 aAddress, ULONG aSize, const std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    if (aBytes.size() != aSize)
+        return setError(E_INVALIDARG, tr("The size (%u) does not match the number of bytes given (%zu)"), aSize, aBytes.size());
+    return i_accessMemory(0 /*idCpu*/, true /*fPhysical*/, aAddress, aSize, NULL, aBytes.data());
 }
 
 HRESULT MachineDebugger::readVirtualMemory(ULONG aCpuId, LONG64 aAddress, ULONG aSize, std::vector<BYTE> &aBytes)

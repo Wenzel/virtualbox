@@ -24998,8 +24998,11 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       <desc>
         Reads guest physical memory, no side effects (MMIO++).
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
+        read, ballooned RAM reads as zeros.  Reading MMIO or unassigned
+        addresses fails with VBOX_E_VM_ERROR at the first such page and does
+        not touch any device.  On a running VM the read is performed by the
+        virtual CPU and waits until it is available.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
@@ -25016,14 +25019,18 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       <desc>
         Writes guest physical memory, access handles (MMIO++) are ignored.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
+        written.  Writing MMIO, ballooned or unassigned addresses fails with
+        VBOX_E_VM_ERROR at the first such page and does not touch any device.
+        The write is not atomic: the pages before the failing one may already
+        have been modified.  On a running VM the write is performed by the
+        virtual CPU and waits until it is available.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
       </param>
       <param name="size" type="unsigned long" dir="in">
-        <desc>The number of bytes to read.</desc>
+        <desc>The number of bytes to write.</desc>
       </param>
       <param name="bytes" type="octet" safearray="yes" dir="in">
         <desc>The bytes to write.</desc>
