@@ -24999,10 +24999,19 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
         Reads guest physical memory, no side effects (MMIO++).
 
         RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
-        read, ballooned RAM reads as zeros.  Reading MMIO or unassigned
-        addresses fails with VBOX_E_VM_ERROR at the first such page and does
-        not touch any device.  On a running VM the read is performed by the
-        virtual CPU and waits until it is available.
+        read, ballooned RAM reads as zeros.  Access handlers are bypassed, so
+        the read never reaches a device.
+
+        The access is done in chunks of 64 KB, each one performed by the
+        virtual CPU on its own thread, so on a running VM every chunk waits
+        until the virtual CPU is available and a big access is not a
+        consistent snapshot; pause the VM for that.  The size is only limited
+        by its 32-bit type, but the whole buffer is transferred in one call.
+
+        Fails with VBOX_E_VM_ERROR, carrying the VBox status code, at the
+        first page that is MMIO (VERR_PGM_PHYS_PAGE_RESERVED) or not assigned
+        (VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS), and with E_ACCESSDENIED if the
+        VM is powered off.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
@@ -25017,14 +25026,22 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="writePhysicalMemory">
       <desc>
-        Writes guest physical memory, access handles (MMIO++) are ignored.
+        Writes guest physical memory, access handlers (MMIO++) are ignored.
 
         RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
-        written.  Writing MMIO, ballooned or unassigned addresses fails with
-        VBOX_E_VM_ERROR at the first such page and does not touch any device.
-        The write is not atomic: the pages before the failing one may already
-        have been modified.  On a running VM the write is performed by the
-        virtual CPU and waits until it is available.
+        written.  Access handlers are bypassed, so the write never reaches a
+        device.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a size does not match the number of bytes
+        given, with VBOX_E_VM_ERROR, carrying the VBox status code, at the
+        first page that is MMIO (VERR_PGM_PHYS_PAGE_RESERVED), ballooned
+        (VERR_PGM_PHYS_PAGE_BALLOONED) or not assigned
+        (VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS), and with E_ACCESSDENIED if the
+        VM is powered off.  The write is not atomic: the pages before the
+        failing one may already have been modified.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
@@ -25041,8 +25058,23 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       <desc>
         Reads guest virtual memory, no side effects (MMIO++).
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The address is translated with the current paging mode and page
+        tables (CR3) of the given virtual CPU, without setting accessed bits.
+        It is a linear address: no segment base is added.  With paging
+        disabled it is used as the guest physical address.  Outside long mode,
+        addresses at or above 4 GB fail, and in long mode non-canonical
+        addresses fail; both with VERR_PAGE_TABLE_NOT_PRESENT.  The guest
+        physical memory it maps is read like <link to="#readPhysicalMemory"/>
+        does.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a cpuId is not a valid virtual CPU, with
+        VBOX_E_VM_ERROR, carrying the VBox status code, at the first page that
+        is not mapped (e.g. VERR_PAGE_NOT_PRESENT,
+        VERR_PAGE_TABLE_NOT_PRESENT) or maps MMIO or unassigned memory, and
+        with E_ACCESSDENIED if the VM is powered off.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25060,10 +25092,24 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="writeVirtualMemory">
       <desc>
-        Writes guest virtual memory, access handles (MMIO++) are ignored.
+        Writes guest virtual memory, access handlers (MMIO++) are ignored.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The address is translated like <link to="#readVirtualMemory"/> does,
+        without setting accessed or dirty bits and ignoring write protection.
+        The guest physical memory it maps is written like
+        <link to="#writePhysicalMemory"/> does.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a cpuId is not a valid virtual CPU or
+        @a size does not match the number of bytes given, with
+        VBOX_E_VM_ERROR, carrying the VBox status code, at the first page that
+        is not mapped (e.g. VERR_PAGE_NOT_PRESENT,
+        VERR_PAGE_TABLE_NOT_PRESENT) or maps memory that
+        <link to="#writePhysicalMemory"/> refuses, and with E_ACCESSDENIED if
+        the VM is powered off.  The write is not atomic: the pages before the
+        failing one may already have been modified.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25072,7 +25118,7 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
         <desc>The guest virtual address.</desc>
       </param>
       <param name="size" type="unsigned long" dir="in">
-        <desc>The number of bytes to read.</desc>
+        <desc>The number of bytes to write.</desc>
       </param>
       <param name="bytes" type="octet" safearray="yes" dir="in">
         <desc>The bytes to write.</desc>

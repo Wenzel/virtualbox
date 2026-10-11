@@ -946,6 +946,8 @@ HRESULT MachineDebugger::i_accessMemory(VMCPUID idCpu, bool fPhysical, LONG64 aA
     if (SUCCEEDED(hrc))
     {
         PCVMMR3VTABLE const pVMM = ptrVM.vtable();
+        if (idCpu >= pVMM->pfnDBGFR3CpuGetCount(ptrVM.rawUVM()))
+            return setError(E_INVALIDARG, tr("Invalid CPU ID: %u"), idCpu);
         for (size_t off = 0; off < cb; off += _64K)
         {
             size_t const cbChunk = RT_MIN(cb - off, _64K);
@@ -985,14 +987,15 @@ HRESULT MachineDebugger::writePhysicalMemory(LONG64 aAddress, ULONG aSize, const
 
 HRESULT MachineDebugger::readVirtualMemory(ULONG aCpuId, LONG64 aAddress, ULONG aSize, std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aCpuId, aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    aBytes.resize(aSize);
+    return i_accessMemory(aCpuId, false /*fPhysical*/, aAddress, aSize, aBytes.data(), NULL);
 }
 
 HRESULT MachineDebugger::writeVirtualMemory(ULONG aCpuId, LONG64 aAddress, ULONG aSize, const std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aCpuId, aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    if (aBytes.size() != aSize)
+        return setError(E_INVALIDARG, tr("The size (%u) does not match the number of bytes given (%zu)"), aSize, aBytes.size());
+    return i_accessMemory(aCpuId, false /*fPhysical*/, aAddress, aSize, NULL, aBytes.data());
 }
 
 HRESULT MachineDebugger::loadPlugIn(const com::Utf8Str &aName, com::Utf8Str &aPlugInName)
