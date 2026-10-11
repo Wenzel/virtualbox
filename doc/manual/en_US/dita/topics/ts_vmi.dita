@@ -1,0 +1,16 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!DOCTYPE topic PUBLIC "-//OASIS//DTD DITA Topic//EN" "topic.dtd">
+<topic xml:lang="en-us" id="ts_vmi">
+  <title>The VBoxVMI Introspection Server</title>
+  
+  <body>
+    <p>On Linux hosts, a <ph conkeyref="vbox-conkeyref-phrases/product-name"/> built with VBoxVMI support can serve the VBoxVMI protocol to a virtual machine introspection (VMI) tool, such as libmicrovmi. The tool connects to a Unix domain socket of the VM process and inspects and controls the running VM through it.</p>
+    <p>VBoxVMI is disabled by default. Enable it for a VM before starting the VM:</p>
+    <pre xml:space="preserve">$ VBoxManage setextradata <varname>VM-name</varname> VBoxInternal/VMI/Enabled 1</pre>
+    <p>When the VM starts, the socket is created as <filepath>vmi/<varname>VM-UUID</varname>.sock</filepath> in the <ph conkeyref="vbox-conkeyref-phrases/product-name"/> user home directory, for example <filepath>$HOME/.config/VirtualBox/vmi/</filepath>. To use another path, set it before starting the VM:</p>
+    <pre xml:space="preserve">$ VBoxManage setextradata <varname>VM-name</varname> VBoxInternal/VMI/SocketPath /path/to/socket</pre>
+    <p>The socket is accessible only by the user running the VM, and only one introspection tool can be connected to a VM at a time. If the socket cannot be created, the VM fails to start. To disable VBoxVMI again, remove the extra data item:</p>
+    <pre xml:space="preserve">$ VBoxManage setextradata <varname>VM-name</varname> VBoxInternal/VMI/Enabled</pre>
+  </body>
+  
+</topic>
