@@ -1247,15 +1247,99 @@ HRESULT MachineDebugger::getRegisters(ULONG aCpuId, std::vector<com::Utf8Str> &a
 
 HRESULT MachineDebugger::setRegister(ULONG aCpuId, const com::Utf8Str &aName, const com::Utf8Str &aValue)
 {
-    RT_NOREF(aCpuId, aName, aValue);
-    ReturnComNotImplemented();
+    try
+    {
+        return setRegisters(aCpuId, std::vector<com::Utf8Str>(1, aName), std::vector<com::Utf8Str>(1, aValue));
+    }
+    catch (std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+}
+
+/**
+ * Parses a register value for setRegister and setRegisters.
+ *
+ * @returns VBox status code, VERR_PARSE_ERROR if @a pszValue is not a valid value.
+ * @param   pszValue    An integer of up to 64 bits (0x prefixed hexadecimal, 0
+ *                      prefixed octal or decimal), or a descriptor table
+ *                      register value as formatted by getRegister (base:limit,
+ *                      the limit in hexadecimal).
+ * @param   pEntry      Where to return the value and its type.
+ */
+static int machineDebuggerParseRegValue(const char *pszValue, PDBGFREGENTRYNM pEntry)
+{
+    char *pszNext = NULL;
+    int vrc = RTStrToUInt64Ex(RTStrStripL(pszValue), &pszNext, 0, &pEntry->Val.u64);
+    if (vrc == VWRN_TRAILING_CHARS && *pszNext == ':')
+    {
+        pEntry->Val.dtr.u64Base = pEntry->Val.u64;
+        pEntry->enmType = DBGFREGVALTYPE_DTR;
+        vrc = RTStrToUInt32Full(pszNext + 1, 16, &pEntry->Val.dtr.u32Limit);
+    }
+    else
+        pEntry->enmType = DBGFREGVALTYPE_U64;
+    if (vrc == VINF_SUCCESS || vrc == VWRN_TRAILING_SPACES)
+        return VINF_SUCCESS;
+    return VERR_PARSE_ERROR;
 }
 
 HRESULT MachineDebugger::setRegisters(ULONG aCpuId, const std::vector<com::Utf8Str> &aNames,
                                       const std::vector<com::Utf8Str> &aValues)
 {
-    RT_NOREF(aCpuId, aNames, aValues);
-    ReturnComNotImplemented();
+    if (aNames.size() != aValues.size())
+        return setError(E_INVALIDARG, tr("The number of names (%zu) does not match the number of values (%zu)"),
+                        aNames.size(), aValues.size());
+
+    /*
+     * Parse all the values before writing anything.
+     */
+    std::vector<DBGFREGENTRYNM> aRegs;
+    try
+    {
+        aRegs.resize(aNames.size());
+    }
+    catch (std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+    for (size_t i = 0; i < aRegs.size(); i++)
+    {
+        aRegs[i].pszName = aNames[i].c_str();
+        int vrc = machineDebuggerParseRegValue(aValues[i].c_str(), &aRegs[i]);
+        if (RT_FAILURE(vrc))
+            return setErrorBoth(E_INVALIDARG, vrc, tr("Invalid value '%s' for register '%s'"),
+                                aValues[i].c_str(), aNames[i].c_str());
+    }
+
+    /*
+     * The prologue.
+     */
+    LogFlowThisFunc(("\n"));
+    AutoWriteLock alock(this COMMA_LOCKVAL_SRC_POS);
+    Console::SafeVMPtr ptrVM(mParent);
+    HRESULT hrc = ptrVM.hrc();
+    if (SUCCEEDED(hrc))
+    {
+        /*
+         * Real work.  One register at a time, so a failure can name the register.
+         * DBGF does each write on the EMT of the register's CPU.
+         */
+        for (size_t i = 0; i < aRegs.size() && SUCCEEDED(hrc); i++)
+        {
+            int vrc = ptrVM.vtable()->pfnDBGFR3RegNmSetBatch(ptrVM.rawUVM(), aCpuId, &aRegs[i], 1);
+            if (RT_SUCCESS(vrc))
+                continue;
+            if (vrc == VERR_DBGF_REGISTER_NOT_FOUND)
+                hrc = setErrorBoth(E_FAIL, vrc, tr("Register '%s' was not found"), aRegs[i].pszName);
+            else if (vrc == VERR_INVALID_CPU_ID)
+                hrc = setErrorBoth(E_FAIL, vrc, tr("Invalid CPU ID: %u"), aCpuId);
+            else
+                hrc = setErrorBoth(VBOX_E_VM_ERROR, vrc, tr("Setting register '%s' to '%s' failed: %Rrc"),
+                                   aRegs[i].pszName, aValues[i].c_str(), vrc);
+        }
+    }
+    return hrc;
 }
 
 HRESULT MachineDebugger::dumpGuestStack(ULONG aCpuId, com::Utf8Str &aStack)
