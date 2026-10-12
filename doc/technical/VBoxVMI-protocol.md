@@ -50,6 +50,9 @@ connection.
 | `0x0001` | `VMI_MSG_HELLO` | `VMIHELLO` | 1 |
 | `0x0002` | `VMI_MSG_PHYS_READ` | see Physical memory read | 1 |
 | `0x0003` | `VMI_MSG_RAM_RANGES` | see RAM ranges | 1 |
+| `0x0004` | `VMI_MSG_PAUSE` | see Pause and resume | 1 |
+| `0x0005` | `VMI_MSG_RESUME` | see Pause and resume | 1 |
+| `0x0006` | `VMI_MSG_VCPU_COUNT` | see vCPU count | 1 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -136,6 +139,50 @@ Reply body: `VMIRAMRANGE` entries (16 bytes each), sorted by address:
 | 0      | 8    | `GCPhysFirst` | Guest physical address of the first byte. |
 | 8      | 8    | `GCPhysLast`  | Guest physical address of the last byte. |
 
+## Pause and resume
+
+`VMI_MSG_PAUSE` pauses the VM and `VMI_MSG_RESUME` resumes it, with
+VirtualBox's standard suspend and resume (those of `VBoxManage controlvm
+pause`/`resume`): by the time the reply is sent, `VBoxManage showvminfo` and
+the GUI show the VM as paused or running.
+
+Request body: empty. Reply body: empty.
+
+- **Synchronous.** The pause reply is sent once every vCPU has stopped
+  executing guest code; the VM stays paused until a resume, from the client or
+  anyone else.
+- **Idempotent, not counted.** Pausing a paused VM and resuming a running one
+  succeed and change nothing. One resume undoes any number of pauses, whoever
+  made them (the client, `VBoxManage`, the GUI).
+
+Reply `rc`, with the connection kept:
+
+- `VINF_SUCCESS` (0): the VM is paused (`VMI_MSG_PAUSE`) or running
+  (`VMI_MSG_RESUME`);
+- `VERR_INVALID_PARAMETER` (-2): nonempty body;
+- `VERR_VM_INVALID_VM_STATE` (-1907): the VM is neither running nor paused
+  (powering on or off, restoring or saving its state, live snapshot,
+  teleporting, ...), or, for `VMI_MSG_RESUME`, it was paused by the host's
+  power management (suspend), which resumes it itself;
+- another VirtualBox status if the suspend or resume itself failed.
+
+The server records which pause is the client's: a `VMI_MSG_PAUSE` that
+suspended the VM, until the client's next `VMI_MSG_RESUME`. In this version the
+VM stays as the client left it when the client disconnects.
+
+## vCPU count
+
+`VMI_MSG_VCPU_COUNT` returns the VM's number of vCPUs, fixed for the VM's
+lifetime. vCPUs are numbered from 0.
+
+Request body: empty (anything else: `VERR_INVALID_PARAMETER`, connection kept).
+
+Reply body (4 bytes):
+
+| Offset | Size | Field   | Meaning |
+|-------:|-----:|---------|---------|
+| 0      | 4    | `cCpus` | Number of vCPUs, at least 1. |
+
 ## Disconnecting
 
 Either side may close the socket at any time. The server then accepts the next
@@ -143,4 +190,5 @@ client.
 
 ## Changes
 
-- Version 1: transport, header and handshake; physical memory read and RAM ranges.
+- Version 1: transport, header and handshake; physical memory read and RAM
+  ranges; pause, resume and vCPU count.

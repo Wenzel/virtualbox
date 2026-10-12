@@ -65,9 +65,7 @@ Later commands are planned as follows:
 
 - physical memory write: served on the server thread like reads (below);
 - full register set of one vCPU: one request to that vCPU's EMT reading or
-  writing the CPU context directly;
-- pause/resume: VirtualBox's standard suspend/resume, visible to the GUI and
-  `VBoxManage`.
+  writing the CPU context directly.
 
 ## Physical memory reads
 
@@ -106,6 +104,40 @@ Later commands are planned as follows:
 - `VMI_MSG_RAM_RANGES` uses `PGMR3PhysGetRamBootZeroedRanges`, which lists the
   RAM ranges that are not ad hoc (ROM, MMIO, MMIO2) and merges contiguous ones.
 
+## Pause and resume
+
+- `VMR3Suspend` and `VMR3Resume` with the user reason, called on the server
+  thread, the same calls `IConsole::Pause` and `IConsole::Resume` make. Main's
+  VM state callback (`Console::i_vmstateChangeCallback`) runs on an EMT
+  during the state change and moves the machine to `Paused` or `Running`, so
+  `VBoxManage`, the GUI and other API clients see VMI pauses like their own,
+  and can undo them. A VMI-only pause flag that Main doesn't know about was
+  rejected: the VM would look running while stopped, and a user could not
+  resume it.
+- Synchronous: both are EMT rendezvous, and `VMR3Suspend` returns after every
+  EMT has left guest code and EMT(0) has suspended the devices. The server
+  thread blocks for that time; no other request of the client is pending.
+- Idempotent and not counted, like `IConsole` but without its "already
+  paused" error: the server checks the VM state first and answers success
+  without a state change when the VM already is in the target state (or reaches
+  it through a racing pause or resume). Other states are refused with
+  `VERR_VM_INVALID_VM_STATE` instead of entering the live-save variants
+  (`RunningLS`), where Main drives the transitions itself.
+- Like `IConsole::Resume`, a VM suspended by the host's power management is not
+  resumed: Main resumes it when the host does.
+- The server checks the VMM state, not Main's machine state: Main suspends
+  the VM itself for an offline (non-live) snapshot, and a client resume in the
+  short window before the save starts would resume it, failing the snapshot.
+  `VBoxManage controlvm resume` refuses that, because Main is not `Paused`
+  then. Accepted: the VMM has no view of Main's states, and routing pause
+  through Main from the VMM would need a new callback interface.
+- The server records the pause it took for the client (`fPausedByClient`): set
+  when the client's pause suspended the VM, cleared by the client's resume and
+  at disconnect. A pause that found the VM suspended already is not the
+  client's. This is what disconnect safety needs to undo the client's pause and
+  only it.
+- `VMI_MSG_VCPU_COUNT` returns `UVM::cCpus`, fixed at VM creation.
+
 ## Security
 
 - The socket file is 0600 from its creation: Linux creates it with the mode
@@ -134,8 +166,10 @@ state (pause ownership, later intercepts).
 
 `vmiR3Disconnect` is the single place where a client's session ends, whatever
 the reason (EOF, socket error, protocol error, handshake failure, VM
-termination). Once commands can change VM state, it undoes them there: it
-resumes a VM the client paused and removes the client's intercepts.
+termination). It is where the server will undo what the client changed:
+resume a VM the client paused (`fPausedByClient`) and remove the client's
+intercepts. For now a VM the client paused stays paused, and the release log
+says so.
 
 ## Why a Unix socket and not shared memory
 
