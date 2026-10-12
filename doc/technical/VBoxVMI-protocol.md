@@ -217,9 +217,13 @@ Reply `rc`, with the connection kept:
 
 The server records which pause is the client's: a `VMI_MSG_PAUSE` that
 suspended the VM (not one that found it paused), until the VM is resumed by
-anyone, the client's `VMI_MSG_RESUME` included. A pause by someone else after
-such a resume is not the client's. In this version the VM stays as the client
-left it when the client disconnects.
+anyone, the client's `VMI_MSG_RESUME` included. On disconnect, the server
+synchronously resumes such a client-owned pause before ending the session.
+A pause by someone else is never resumed: this includes a VM paused before the
+client's no-op pause, and an external pause after someone resumed the client's
+pause. If power-off or destruction has already made resume impossible, cleanup
+logs the failure and ends without changing that transition. Future per-client
+intercepts are removed at the same session-cleanup point.
 
 ## vCPU count
 

@@ -24,11 +24,16 @@ how the server is built and why. The wire protocol is in `VBoxVMI-protocol.md`.
 - Stopped in `VMR3Destroy`, on the caller's (non-EMT) thread, right after the
   state changes to Destroying and before the destroy request goes to the
   EMTs. The VM is already off, but the EMTs still serve requests, so a server
-  thread waiting for an EMT (registers, pause/resume) gets its answer and
-  the disconnect cleanup can still use the EMTs. The later `vmR3Destroy` on
-  EMT(0), where the debugger console stops, only covers paths that bypass
-  `VMR3Destroy`. A state-change callback on power off was not used: it runs
-  on an EMT, which a server thread could be waiting for.
+  thread waiting for an EMT (registers, pause/resume) gets its answer. The
+  server thread is woken and its client socket is shut down; it performs the
+  normal session cleanup and exits before the resume-count state callback is
+  deregistered and its instance is freed. If its bounded wait expires, both
+  the instance and callback are left in place rather than risking a callback
+  use-after-free or hanging teardown. The later `vmR3Destroy` on EMT(0), where
+  the debugger console stops, only covers paths that bypass `VMR3Destroy`. A
+  state-change callback does not initiate cleanup on `POWERING_OFF`: callbacks
+  run on an EMT and may not change VM state, while the server can already be
+  waiting for an EMT.
 - CFGM node `VMI`, set through extradata `VBoxInternal/VMI/...`:
   - `Enabled` (bool, default false). Off unless enabled per VM.
   - `SocketPath` (string). Main (`Console::i_configGuestDbg`) inserts the
@@ -265,12 +270,20 @@ state (pause ownership, later intercepts).
 
 ## Disconnect
 
-`vmiR3Disconnect` is the single place where a client's session ends, whatever
-the reason (EOF, socket error, protocol error, handshake failure, VM
-termination). It is where the server will undo what the client changed:
-resume a VM the client paused (`fPausedByClient`) and remove the client's
-intercepts. For now a VM the client paused stays paused, and the release log
-says so.
+`vmiR3Disconnect` ends every accepted client session, whether because of EOF,
+a socket or send-timeout error, a malformed request, failed handshake, normal
+close, or VM termination. It calls `vmiR3CleanupSession` exactly once before
+discarding the session state. That function is also the explicit cleanup point
+for future per-client intercept ownership.
+
+If the session's pause is still its own according to the resume generation,
+cleanup checks the same run-state restrictions as an explicit resume and calls
+`VMR3Resume` synchronously. It drops pause ownership only after that call has
+returned with the VM in `Running`, or after logging why it could not resume
+during a concurrent power-off or destruction. A pause that merely found the VM
+paused is not owned. A resume by any actor ends ownership, so an external
+resume followed by an external pause is left paused when the client
+disconnects.
 
 ## Why a Unix socket and not shared memory
 

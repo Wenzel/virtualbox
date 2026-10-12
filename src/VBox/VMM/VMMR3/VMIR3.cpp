@@ -230,23 +230,52 @@ static bool vmiR3IsPausedByClient(PVMIR3 pThis)
 }
 
 
+static int vmiR3CheckPauseResume(PUVM pUVM, bool fPause, bool *pfDone);
+
+
 /**
- * Drops the connected client.
+ * Undoes state owned by the connected client.
  *
- * This is where a client session ends, whatever the reason, so this is where
- * the server will undo what the client did to the VM (resume it if
- * vmiR3IsPausedByClient, intercepts).  For now the VM stays as the client left
- * it.
+ * This is the single cleanup point for a session.  Future per-client
+ * intercept ownership must be released here before the session state is
+ * discarded.
+ */
+static void vmiR3CleanupSession(PVMIR3 pThis)
+{
+    if (vmiR3IsPausedByClient(pThis))
+    {
+        bool fDone = false;
+        int rc = vmiR3CheckPauseResume(pThis->pUVM, false /*fPause*/, &fDone);
+        if (RT_SUCCESS(rc) && !fDone && vmiR3IsPausedByClient(pThis))
+        {
+            rc = VMR3Resume(pThis->pUVM, VMRESUMEREASON_USER);
+            VMSTATE const enmState = VMR3GetStateU(pThis->pUVM);
+            if (RT_SUCCESS(rc) && enmState == VMSTATE_RUNNING)
+                LogRel(("VMI: Resumed the VM paused by the disconnected client\n"));
+            else
+                LogRel(("VMI: Failed to resume the VM paused by the disconnected client: %Rrc (VM state %s)\n",
+                        rc, VMR3GetStateName(enmState)));
+        }
+        else if (RT_FAILURE(rc))
+            LogRel(("VMI: Cannot resume the VM paused by the disconnected client: %Rrc (VM state %s)\n",
+                    rc, VMR3GetStateName(VMR3GetStateU(pThis->pUVM))));
+    }
+    pThis->fPausedByClient = false;
+}
+
+
+/**
+ * Drops the connected client after undoing its session state.
  */
 static void vmiR3Disconnect(PVMIR3 pThis)
 {
-    LogRel(("VMI: Client disconnected%s\n", vmiR3IsPausedByClient(pThis) ? ", leaving the VM paused by the client" : ""));
+    vmiR3CleanupSession(pThis);
+    LogRel(("VMI: Client disconnected\n"));
     RTSemFastMutexRequest(pThis->hMtxClient);
     close(pThis->fdClient);
     pThis->fdClient = -1;
     RTSemFastMutexRelease(pThis->hMtxClient);
-    pThis->fHandshaked     = false;
-    pThis->fPausedByClient = false;
+    pThis->fHandshaked = false;
 }
 
 
@@ -1408,12 +1437,6 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
     if (!pThis)
         return;
 
-    if (pThis->fAtStateRegistered)
-    {
-        int rc = VMR3AtStateDeregister(pUVM, vmiR3AtState, pThis);
-        AssertRC(rc);
-        pThis->fAtStateRegistered = false;
-    }
 
     if (pThis->hThread != NIL_RTTHREAD)
     {
@@ -1437,6 +1460,13 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
             return;
         }
     }
+    if (pThis->fAtStateRegistered)
+    {
+        int rc = VMR3AtStateDeregister(pUVM, vmiR3AtState, pThis);
+        AssertRC(rc);
+        pThis->fAtStateRegistered = false;
+    }
+
     if (pThis->fdListen >= 0)
         close(pThis->fdListen);
     if (pThis->fBound)
