@@ -139,14 +139,19 @@ static DECLCALLBACK(int) cpumR3RegGet_rflags(void *pvUser, PCDBGFREGDESC pDesc, 
  */
 static DECLCALLBACK(int) cpumR3RegSet_rflags(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue, PCDBGFREGVAL pfMask)
 {
-    PVMCPU         pVCpu = (PVMCPU)pvUser;
-    uint64_t const fMask = pfMask->u64 & CPUMX86EFLAGS_HW_MASK_64;
+    PVMCPU         pVCpu     = (PVMCPU)pvUser;
+    uint64_t const fMask     = pfMask->u64 & CPUMX86EFLAGS_HW_MASK_64;
+    uint64_t const fNewValue = (pVCpu->cpum.s.Guest.rflags.uBoth & ~fMask) | (pValue->u64 & fMask);
     RT_NOREF(pDesc);
 
     VMCPU_ASSERT_EMT(pVCpu);
     Assert(pDesc->enmType == DBGFREGVALTYPE_U64);
 
-    pVCpu->cpum.s.Guest.rflags.uBoth = (pVCpu->cpum.s.Guest.rflags.uBoth & ~fMask) | (pValue->u64 & fMask);
+    if (   (fNewValue & X86_EFL_RA1_MASK) != X86_EFL_RA1_MASK
+        || (fNewValue & X86_EFL_RAZ_MASK & CPUMX86EFLAGS_HW_MASK_64) != 0)
+        return VERR_INVALID_PARAMETER;
+
+    pVCpu->cpum.s.Guest.rflags.uBoth = fNewValue;
     return VINF_SUCCESS;
 }
 
@@ -1265,7 +1270,7 @@ static DBGFREGSUBFIELD const g_aCpumRegFields_msr_ia32_spec_ctrl[] =
     CPU_REG_RW_AS(#LName,           UName,          U64, LName,                 cpumR3RegGet_Generic, cpumR3RegSet_Generic, g_aCpumRegAliases_##LName,  NULL)
 
 #define CPU_REG_SEG(UName, LName) \
-    CPU_REG_RW_AS(#LName,           UName,          U16, LName.Sel,             cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, g_aCpumRegFields_seg), \
+    CPU_REG_RW_AS(#LName,           UName,          U16, LName.Sel,             cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                ), \
     CPU_REG_RW_AS(#LName "_attr",   UName##_ATTR,   U32, LName.Attr.u,          cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, g_aCpumRegFields_seg), \
     CPU_REG_RW_AS(#LName "_base",   UName##_BASE,   U64, LName.u64Base,         cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                ), \
     CPU_REG_RW_AS(#LName "_lim",    UName##_LIMIT,  U32, LName.u32Limit,        cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                )
