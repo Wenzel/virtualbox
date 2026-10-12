@@ -49,6 +49,7 @@
 #include <VBox/vmm/uvm.h>
 #include <VBox/err.h>
 #include <VBox/log.h>
+#include <iprt/asm.h>
 #include <iprt/assert.h>
 #include <iprt/dir.h>
 #include <iprt/mem.h>
@@ -109,10 +110,19 @@ typedef struct VMIR3
     int             afdWakeup[2];
     /** Set when the client completed the handshake. */
     bool            fHandshaked;
-    /** Set while the VM is suspended because the client asked for it: a
-     *  VMI_MSG_PAUSE suspended it (not one that found it suspended already).
-     *  Cleared by the client's VMI_MSG_RESUME and when the session ends. */
+    /** Set when a VMI_MSG_PAUSE of the connected client suspended the VM (not
+     *  one that found it suspended already).  Cleared by the client's
+     *  VMI_MSG_RESUME and when the session ends.  The VM is still suspended by
+     *  that pause only while cResumes equals cResumesAtPause, see
+     *  vmiR3IsPausedByClient. */
     bool            fPausedByClient;
+    /** cResumes read before the client's pause suspended the VM. */
+    uint32_t        cResumesAtPause;
+    /** Number of resumes (VMSTATE_RESUMING) by anyone, counted by vmiR3AtState
+     *  on an EMT. */
+    uint32_t volatile cResumes;
+    /** Set while vmiR3AtState is registered. */
+    bool            fAtStateRegistered;
     /** RTTimeMilliTS until which accepting is suspended (out of descriptors). */
     uint64_t        msAcceptResume;
     /** The socket path (heap). */
@@ -189,15 +199,42 @@ static int vmiR3SendHello(int fd, uint32_t idReq, uint16_t fFlags, int32_t rcMsg
 
 
 /**
+ * @callback_method_impl{FNVMATSTATE, Counts the resumes.}
+ *
+ * Runs on the EMT changing the state.  The only way from Suspended back to
+ * running is Resuming (a reset of a suspended VM leaves it suspended).
+ */
+static DECLCALLBACK(void) vmiR3AtState(PUVM pUVM, PCVMMR3VTABLE pVMM, VMSTATE enmState, VMSTATE enmOldState, void *pvUser)
+{
+    RT_NOREF(pUVM, pVMM, enmOldState);
+    if (enmState == VMSTATE_RESUMING)
+        ASMAtomicIncU32(&((PVMIR3)pvUser)->cResumes);
+}
+
+
+/**
+ * Whether the VM is still suspended by the connected client's pause: the
+ * client's pause suspended it and nobody resumed it since, even if someone
+ * paused it again.
+ */
+static bool vmiR3IsPausedByClient(PVMIR3 pThis)
+{
+    return pThis->fPausedByClient
+        && ASMAtomicReadU32(&pThis->cResumes) == pThis->cResumesAtPause;
+}
+
+
+/**
  * Drops the connected client.
  *
  * This is where a client session ends, whatever the reason, so this is where
- * the server will undo what the client did to the VM (resume if
- * fPausedByClient, intercepts).  For now the VM stays as the client left it.
+ * the server will undo what the client did to the VM (resume it if
+ * vmiR3IsPausedByClient, intercepts).  For now the VM stays as the client left
+ * it.
  */
 static void vmiR3Disconnect(PVMIR3 pThis)
 {
-    LogRel(("VMI: Client disconnected%s\n", pThis->fPausedByClient ? ", leaving the VM paused" : ""));
+    LogRel(("VMI: Client disconnected%s\n", vmiR3IsPausedByClient(pThis) ? ", leaving the VM paused by the client" : ""));
     RTSemFastMutexRequest(pThis->hMtxClient);
     close(pThis->fdClient);
     pThis->fdClient = -1;
@@ -453,6 +490,48 @@ static bool vmiR3HandleRamRanges(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
 
 
 /**
+ * Checks whether a pause or resume may be done in the current VM state.
+ *
+ * @returns VINF_SUCCESS, or VERR_VM_INVALID_VM_STATE if it is refused.
+ * @param   pUVM        The user mode VM handle.
+ * @param   fPause      Pause (true) or resume (false).
+ * @param   pfDone      Set if the VM is in the target state already.
+ */
+static int vmiR3CheckPauseResume(PUVM pUVM, bool fPause, bool *pfDone)
+{
+    *pfDone = false;
+    VMSTATE const enmState = VMR3GetStateU(pUVM);
+    if (enmState == VMSTATE_RUNNING)
+    {
+        *pfDone = !fPause;
+        return VINF_SUCCESS;
+    }
+    if (enmState != VMSTATE_SUSPENDED)
+        return VERR_VM_INVALID_VM_STATE; /* Powering on or off, saving, live snapshot, teleporting, ... */
+
+    /* Main suspends the VM for a configuration change (medium, network) with its
+       state callback disabled, so it still shows the VM as running, and resumes
+       it when done: neither a pause (Main would resume it) nor a resume (in the
+       middle of the change) may count on that suspension. */
+    VMSUSPENDREASON const enmReason = VMR3GetSuspendReason(pUVM);
+    if (enmReason == VMSUSPENDREASON_RECONFIG)
+        return VERR_VM_INVALID_VM_STATE;
+    if (fPause)
+    {
+        *pfDone = true;
+        return VINF_SUCCESS;
+    }
+    /* Like IConsole::Resume: the host resume resumes a VM suspended by the host's
+       power management.  A teleport source is suspended with its disks handed
+       over to the target: only Main may resume it, if the teleport fails. */
+    if (   enmReason == VMSUSPENDREASON_HOST_SUSPEND
+        || VMR3TeleportedAndNotFullyResumedYet(pUVM->pVM))
+        return VERR_VM_INVALID_VM_STATE;
+    return VINF_SUCCESS;
+}
+
+
+/**
  * Handles VMI_MSG_PAUSE and VMI_MSG_RESUME requests.
  *
  * VirtualBox's standard suspend and resume, as IConsole::Pause and
@@ -468,36 +547,36 @@ static bool vmiR3HandleRamRanges(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
  */
 static bool vmiR3HandlePauseResume(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 {
-    PUVM          pUVM    = pThis->pUVM;
-    bool const    fPause  = pHdr->uType == VMI_MSG_PAUSE;
-    VMSTATE const enmFrom = fPause ? VMSTATE_RUNNING   : VMSTATE_SUSPENDED;
-    VMSTATE const enmTo   = fPause ? VMSTATE_SUSPENDED : VMSTATE_RUNNING;
-
-    int rc = cbBody ? VERR_INVALID_PARAMETER : VINF_SUCCESS;
-    if (RT_SUCCESS(rc))
+    PUVM       pUVM   = pThis->pUVM;
+    bool const fPause = pHdr->uType == VMI_MSG_PAUSE;
+    bool       fDone  = false;
+    int rc = cbBody ? VERR_INVALID_PARAMETER : vmiR3CheckPauseResume(pUVM, fPause, &fDone);
+    if (RT_SUCCESS(rc) && !fDone)
     {
-        VMSTATE const enmState = VMR3GetStateU(pUVM);
-        if (enmState == enmTo)
-            rc = VINF_SUCCESS;
-        else if (enmState != enmFrom)
-            rc = VERR_VM_INVALID_VM_STATE; /* Powering on or off, saving, live snapshot, teleporting, ... */
-        else if (!fPause && VMR3GetSuspendReason(pUVM) == VMSUSPENDREASON_HOST_SUSPEND)
-            rc = VERR_VM_INVALID_VM_STATE; /* Like IConsole::Resume: the host resume does it. */
+        /* Read before suspending: a resume between this and the suspend can only
+           make the pause look like someone else's, never the reverse. */
+        uint32_t const cResumes = ASMAtomicReadU32(&pThis->cResumes);
+        rc = fPause ? VMR3Suspend(pUVM, VMSUSPENDREASON_USER) : VMR3Resume(pUVM, VMRESUMEREASON_USER);
+        if (RT_SUCCESS(rc))
+        {
+            rc = VINF_SUCCESS; /* Not the EM scheduling status. */
+            if (fPause)
+            {
+                pThis->fPausedByClient = true;
+                pThis->cResumesAtPause = cResumes;
+            }
+        }
         else
         {
-            rc = fPause ? VMR3Suspend(pUVM, VMSUSPENDREASON_USER) : VMR3Resume(pUVM, VMRESUMEREASON_USER);
-            if (RT_SUCCESS(rc))
-            {
-                rc = VINF_SUCCESS; /* Not the EM scheduling status. */
-                pThis->fPausedByClient = fPause;
-            }
-            else if (VMR3GetStateU(pUVM) == enmTo)
-                rc = VINF_SUCCESS; /* Someone else paused or resumed it meanwhile. */
-            Log(("VMI: %s the VM for the client: %Rrc\n", fPause ? "Suspending" : "Resuming", rc));
+            /* Someone else may have paused or resumed it meanwhile. */
+            int const rc2 = vmiR3CheckPauseResume(pUVM, fPause, &fDone);
+            if (RT_FAILURE(rc2) || fDone)
+                rc = rc2;
         }
-        if (RT_SUCCESS(rc) && !fPause)
-            pThis->fPausedByClient = false;
+        Log(("VMI: %s the VM for the client: %Rrc\n", fPause ? "Suspending" : "Resuming", rc));
     }
+    if (RT_SUCCESS(rc) && !fPause)
+        pThis->fPausedByClient = false;
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
 }
 
@@ -802,6 +881,11 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
         rc = VM_SET_ERROR_U(pUVM, RTErrConvertFromErrno(errno), "VMI: pipe2 failed");
     if (RT_SUCCESS(rc))
     {
+        rc = VMR3AtStateRegister(pUVM, vmiR3AtState, pThis);
+        pThis->fAtStateRegistered = RT_SUCCESS(rc);
+    }
+    if (RT_SUCCESS(rc))
+    {
         rc = RTThreadCreate(&pThis->hThread, vmiR3Thread, pThis, 0 /*cbStack*/, RTTHREADTYPE_IO,
                             RTTHREADFLAGS_WAITABLE, "VMI");
         if (RT_SUCCESS(rc))
@@ -831,10 +915,16 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
  */
 VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
 {
-    RT_NOREF(pUVM);
     PVMIR3 pThis = (PVMIR3)pvVmi;
     if (!pThis)
         return;
+
+    if (pThis->fAtStateRegistered)
+    {
+        int rc = VMR3AtStateDeregister(pUVM, vmiR3AtState, pThis);
+        AssertRC(rc);
+        pThis->fAtStateRegistered = false;
+    }
 
     if (pThis->hThread != NIL_RTTHREAD)
     {
