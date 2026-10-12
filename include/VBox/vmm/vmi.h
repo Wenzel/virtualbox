@@ -83,6 +83,12 @@ RT_C_DECLS_BEGIN
 /** Get the number of vCPUs.  Request body: empty.
  *  Reply body: a uint32_t, the vCPU count. */
 #define VMI_MSG_VCPU_COUNT          UINT16_C(0x0006)
+/** Read the registers of one vCPU.  Request body: VMIVCPUREQ.
+ *  Reply body: VMIX86REGS. */
+#define VMI_MSG_REGS_READ           UINT16_C(0x0007)
+/** Write the registers of one vCPU.  Request body: VMIVCPUREQ followed by
+ *  VMIX86REGS.  Reply body: empty. */
+#define VMI_MSG_REGS_WRITE          UINT16_C(0x0008)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -148,6 +154,93 @@ typedef struct VMIRAMRANGE
     uint64_t    GCPhysLast;
 } VMIRAMRANGE;
 AssertCompileSize(VMIRAMRANGE, 16);
+
+/**
+ * The vCPU a VMI_MSG_REGS_READ or VMI_MSG_REGS_WRITE request is for.
+ */
+typedef struct VMIVCPUREQ
+{
+    /** The vCPU ID, less than the VMI_MSG_VCPU_COUNT count. */
+    uint32_t    idCpu;
+    /** Reserved, zero. */
+    uint32_t    u32Reserved;
+} VMIVCPUREQ;
+AssertCompileSize(VMIVCPUREQ, 8);
+
+/**
+ * A segment register in VMIX86REGS: the selector and its hidden base and
+ * limit.  The attributes are not part of it, writes leave them unchanged.
+ */
+typedef struct VMIX86SEG
+{
+    /** The base address. */
+    uint64_t    u64Base;
+    /** The limit, in bytes (the granularity applied). */
+    uint32_t    u32Limit;
+    /** The selector. */
+    uint16_t    Sel;
+    /** Reserved, zero. */
+    uint16_t    u16Reserved;
+} VMIX86SEG;
+AssertCompileSize(VMIX86SEG, 16);
+
+/**
+ * A descriptor table register (GDTR, IDTR) in VMIX86REGS.
+ */
+typedef struct VMIX86DTR
+{
+    /** The base address. */
+    uint64_t    u64Base;
+    /** The limit. */
+    uint16_t    cbLimit;
+    /** Reserved, zero. */
+    uint16_t    au16Reserved[3];
+} VMIX86DTR;
+AssertCompileSize(VMIX86DTR, 16);
+
+/**
+ * The registers of an x86 vCPU, the body of a VMI_MSG_REGS_READ reply and
+ * part of a VMI_MSG_REGS_WRITE request.
+ */
+typedef struct VMIX86REGS
+{
+    /** The general purpose registers, in instruction encoding order: rax, rcx,
+     *  rdx, rbx, rsp, rbp, rsi, rdi, r8 to r15. */
+    uint64_t    aGRegs[16];
+    uint64_t    rip;
+    /** RFLAGS, the architectural bits only. */
+    uint64_t    rflags;
+    uint64_t    cr0;
+    uint64_t    cr2;
+    uint64_t    cr3;
+    uint64_t    cr4;
+    /** MSR_K6_EFER. */
+    uint64_t    msrEFER;
+    /** MSR_K6_STAR. */
+    uint64_t    msrSTAR;
+    /** MSR_K8_LSTAR. */
+    uint64_t    msrLSTAR;
+    /** MSR_IA32_SYSENTER_CS. */
+    uint64_t    msrSysEnterCs;
+    /** MSR_IA32_SYSENTER_ESP. */
+    uint64_t    msrSysEnterEsp;
+    /** MSR_IA32_SYSENTER_EIP. */
+    uint64_t    msrSysEnterEip;
+    /** MSR_IA32_APICBASE. */
+    uint64_t    msrApicBase;
+    /** The segment registers, in instruction encoding order. */
+    VMIX86SEG   es;
+    VMIX86SEG   cs;
+    VMIX86SEG   ss;
+    VMIX86SEG   ds;
+    VMIX86SEG   fs;
+    VMIX86SEG   gs;
+    VMIX86SEG   ldtr;
+    VMIX86SEG   tr;
+    VMIX86DTR   gdtr;
+    VMIX86DTR   idtr;
+} VMIX86REGS;
+AssertCompileSize(VMIX86REGS, 392);
 
 #ifdef IN_RING3
 VMMR3_INT_DECL(int)  VMIR3Create(PUVM pUVM, void **ppvVmi);

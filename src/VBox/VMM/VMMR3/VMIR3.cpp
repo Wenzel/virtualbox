@@ -41,10 +41,14 @@
 *   Header Files                                                                                                                 *
 *********************************************************************************************************************************/
 #define LOG_GROUP LOG_GROUP_VM
+#define VMCPU_INCL_CPUM_GST_CTX /* The register commands access the guest context directly. */
 #include <VBox/vmm/vmi.h>
 #include <VBox/vmm/cfgm.h>
+#include <VBox/vmm/cpum.h>
+#include <VBox/vmm/hm.h>
 #include <VBox/vmm/mm.h>
 #include <VBox/vmm/pgm.h>
+#include <VBox/vmm/vmm.h>
 #include <VBox/vmm/vm.h>
 #include <VBox/vmm/uvm.h>
 #include <VBox/err.h>
@@ -597,6 +601,363 @@ static bool vmiR3HandleVCpuCount(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
 }
 
 
+#ifdef VBOX_VMM_TARGET_X86
+
+/** The MSRs of VMIX86REGS read with CPUMQueryGuestMsr and written with
+ *  CPUMSetGuestMsr, in write order.  The APIC base is last: it is the only one
+ *  whose old value may not be writable back (APIC mode transitions). */
+static uint32_t const g_aidVmiMsrs[] =
+{
+    MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP, MSR_IA32_SYSENTER_EIP, MSR_K6_STAR, MSR_K8_LSTAR, MSR_IA32_APICBASE
+};
+
+
+/**
+ * Gets the g_aidVmiMsrs values of a VMIX86REGS, in the same order.
+ */
+static void vmiR3RegsGetMsrValues(VMIX86REGS const *pRegs, uint64_t pauValues[RT_ELEMENTS(g_aidVmiMsrs)])
+{
+    pauValues[0] = pRegs->msrSysEnterCs;
+    pauValues[1] = pRegs->msrSysEnterEsp;
+    pauValues[2] = pRegs->msrSysEnterEip;
+    pauValues[3] = pRegs->msrSTAR;
+    pauValues[4] = pRegs->msrLSTAR;
+    pauValues[5] = pRegs->msrApicBase;
+    AssertCompile(RT_ELEMENTS(g_aidVmiMsrs) == 6);
+}
+
+
+/**
+ * Reads a guest MSR, zero if the guest CPU doesn't have it (RDMSR would raise
+ * \#GP).
+ */
+static uint64_t vmiR3QueryMsr(PVMCPU pVCpu, uint32_t idMsr)
+{
+    uint64_t uValue = 0;
+    VBOXSTRICTRC rcStrict = CPUMQueryGuestMsr(pVCpu, idMsr, &uValue);
+    return rcStrict == VINF_SUCCESS ? uValue : 0;
+}
+
+
+/**
+ * Copies a segment register to its VMIX86SEG.
+ */
+static void vmiR3SegGet(VMIX86SEG *pDst, CPUMSELREG const *pSrc)
+{
+    pDst->u64Base  = pSrc->u64Base;
+    pDst->u32Limit = pSrc->u32Limit;
+    pDst->Sel      = pSrc->Sel;
+}
+
+
+/**
+ * Reads the registers of the calling EMT's vCPU, the VMI_MSG_REGS_READ worker.
+ *
+ * @returns VBox status code.
+ * @param   pVM         The cross context VM structure.
+ * @param   pRegs       Where to return the registers.
+ * @thread  The EMT of the vCPU.
+ */
+static DECLCALLBACK(int) vmiR3RegsReadOnEmt(PVM pVM, VMIX86REGS *pRegs)
+{
+    PVMCPU const pVCpu = VMMGetCpu(pVM);
+    CPUM_IMPORT_EXTRN_RET(pVCpu, CPUMCTX_EXTRN_ALL);
+    PCCPUMCTX const pCtx = &pVCpu->cpum.GstCtx;
+
+    RT_BZERO(pRegs, sizeof(*pRegs));
+    for (unsigned i = 0; i < RT_ELEMENTS(pRegs->aGRegs); i++)
+        pRegs->aGRegs[i] = pCtx->aGRegs[i].u64;
+    pRegs->rip            = pCtx->rip;
+    pRegs->rflags         = pCtx->rflags.uBoth & CPUMX86EFLAGS_HW_MASK_64; /* CPUM keeps internal state in the rest. */
+    pRegs->cr0            = pCtx->cr0;
+    pRegs->cr2            = pCtx->cr2;
+    pRegs->cr3            = pCtx->cr3;
+    pRegs->cr4            = pCtx->cr4;
+    pRegs->msrEFER        = pCtx->msrEFER;
+    pRegs->msrSTAR        = vmiR3QueryMsr(pVCpu, MSR_K6_STAR);
+    pRegs->msrLSTAR       = vmiR3QueryMsr(pVCpu, MSR_K8_LSTAR);
+    pRegs->msrSysEnterCs  = vmiR3QueryMsr(pVCpu, MSR_IA32_SYSENTER_CS);
+    pRegs->msrSysEnterEsp = vmiR3QueryMsr(pVCpu, MSR_IA32_SYSENTER_ESP);
+    pRegs->msrSysEnterEip = vmiR3QueryMsr(pVCpu, MSR_IA32_SYSENTER_EIP);
+    pRegs->msrApicBase    = vmiR3QueryMsr(pVCpu, MSR_IA32_APICBASE);
+    vmiR3SegGet(&pRegs->es,   &pCtx->es);
+    vmiR3SegGet(&pRegs->cs,   &pCtx->cs);
+    vmiR3SegGet(&pRegs->ss,   &pCtx->ss);
+    vmiR3SegGet(&pRegs->ds,   &pCtx->ds);
+    vmiR3SegGet(&pRegs->fs,   &pCtx->fs);
+    vmiR3SegGet(&pRegs->gs,   &pCtx->gs);
+    vmiR3SegGet(&pRegs->ldtr, &pCtx->ldtr);
+    vmiR3SegGet(&pRegs->tr,   &pCtx->tr);
+    pRegs->gdtr.u64Base   = pCtx->gdtr.pGdt;
+    pRegs->gdtr.cbLimit   = pCtx->gdtr.cbGdt;
+    pRegs->idtr.u64Base   = pCtx->idtr.pIdt;
+    pRegs->idtr.cbLimit   = pCtx->idtr.cbIdt;
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Checks the reserved fields of a VMIX86REGS.
+ */
+static bool vmiR3RegsAreReservedZero(VMIX86REGS const *pRegs)
+{
+    VMIX86SEG const *apSegs[] = { &pRegs->es, &pRegs->cs, &pRegs->ss, &pRegs->ds, &pRegs->fs, &pRegs->gs, &pRegs->ldtr, &pRegs->tr };
+    for (unsigned i = 0; i < RT_ELEMENTS(apSegs); i++)
+        if (apSegs[i]->u16Reserved)
+            return false;
+    VMIX86DTR const *apDtrs[] = { &pRegs->gdtr, &pRegs->idtr };
+    for (unsigned i = 0; i < RT_ELEMENTS(apDtrs); i++)
+        if (apDtrs[i]->au16Reserved[0] || apDtrs[i]->au16Reserved[1] || apDtrs[i]->au16Reserved[2])
+            return false;
+    return true;
+}
+
+
+/**
+ * Checks the values of a VMI_MSG_REGS_WRITE request that the CPU itself would
+ * refuse to load (\#GP on POPF, MOV to CRx or WRMSR), checking the control
+ * registers and EFER as a whole.  Values equal to the current ones are always
+ * accepted, so that registers read earlier can be written back.  The MSRs are
+ * checked by CPUMSetGuestMsr when written.
+ */
+static bool vmiR3RegsAreValid(PVM pVM, PCCPUMCTX pCtx, VMIX86REGS const *pNew)
+{
+    if (   pNew->rflags != (pCtx->rflags.uBoth & CPUMX86EFLAGS_HW_MASK_64)
+        && (   !(pNew->rflags & X86_EFL_RA1_MASK)
+            || (pNew->rflags & ~(uint64_t)(X86_EFL_LIVE_MASK | X86_EFL_RA1_MASK))))
+        return false;
+
+    if (   pNew->cr3 != pCtx->cr3
+        && (pNew->cr3 & (UINT64_MAX << pVM->cpum.ro.GuestFeatures.cMaxPhysAddrWidth)))
+        return false;
+
+    if (   pNew->cr0     == pCtx->cr0
+        && pNew->cr4     == pCtx->cr4
+        && pNew->msrEFER == pCtx->msrEFER)
+        return true;
+    uint64_t const uCr0  = pNew->cr0;
+    uint64_t const uCr4  = pNew->cr4;
+    uint64_t const uEfer = pNew->msrEFER;
+    bool const     fLma  = RT_BOOL(uEfer & MSR_K6_EFER_LMA);
+    return !(uCr0 & ~CPUMGetGuestCR0ValidMask())
+        && (!(uCr0 & X86_CR0_PG) || (uCr0 & X86_CR0_PE))
+        && (!(uCr0 & X86_CR0_NW) || (uCr0 & X86_CR0_CD))
+        && !(uCr4 & ~CPUMGetGuestCR4ValidMask(pVM))
+        && !(uEfer & ~CPUMGetGuestEferMsrValidMask(pVM))
+        /* EFER.LMA is CR0.PG and EFER.LME, long mode needs PAE, and PCIDE long mode. */
+        && fLma == ((uCr0 & X86_CR0_PG) && (uEfer & MSR_K6_EFER_LME))
+        && (!fLma || (uCr4 & X86_CR4_PAE))
+        && (!(uCr4 & X86_CR4_PCIDE) || fLma);
+}
+
+
+/**
+ * Writes the changed MSRs of a VMI_MSG_REGS_WRITE request in g_aidVmiMsrs order.
+ *
+ * @returns VBox status code, VERR_INVALID_PARAMETER if the guest CPU refuses a
+ *          value (WRMSR would raise \#GP).
+ * @param   pVCpu       The cross context virtual CPU structure.
+ * @param   pauOld      The current values.
+ * @param   pauNew      The new values.
+ * @param   pcDone      Where to return how many of them were processed, for
+ *                      vmiR3MsrsUndo.
+ */
+static int vmiR3MsrsSet(PVMCPU pVCpu, uint64_t const *pauOld, uint64_t const *pauNew, size_t *pcDone)
+{
+    for (size_t i = 0; i < RT_ELEMENTS(g_aidVmiMsrs); i++)
+    {
+        *pcDone = i;
+        if (pauNew[i] == pauOld[i])
+            continue;
+        VBOXSTRICTRC rcStrict = CPUMSetGuestMsr(pVCpu, g_aidVmiMsrs[i], pauNew[i]);
+        if (rcStrict != VINF_SUCCESS)
+        {
+            if (rcStrict == VERR_CPUM_RAISE_GP_0)
+                return VERR_INVALID_PARAMETER;
+            return RT_FAILURE(VBOXSTRICTRC_VAL(rcStrict)) ? VBOXSTRICTRC_VAL(rcStrict) : VERR_IPE_UNEXPECTED_INFO_STATUS;
+        }
+    }
+    *pcDone = RT_ELEMENTS(g_aidVmiMsrs);
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Writes back the old values of the first @a cMsrs MSRs vmiR3MsrsSet processed.
+ */
+static void vmiR3MsrsUndo(PVMCPU pVCpu, uint64_t const *pauOld, uint64_t const *pauNew, size_t cMsrs)
+{
+    while (cMsrs-- > 0)
+        if (pauNew[cMsrs] != pauOld[cMsrs])
+        {
+            VBOXSTRICTRC rcStrict = CPUMSetGuestMsr(pVCpu, g_aidVmiMsrs[cMsrs], pauOld[cMsrs]);
+            if (rcStrict != VINF_SUCCESS)
+                LogRel(("VMI: Failed to restore MSR %#x of vCPU %u to %#RX64: %Rrc\n",
+                        g_aidVmiMsrs[cMsrs], pVCpu->idCpu, pauOld[cMsrs], VBOXSTRICTRC_VAL(rcStrict)));
+        }
+}
+
+
+/**
+ * Writes a segment register from its VMIX86SEG, if it changed, as raw state:
+ * no descriptor table load, the attributes are kept, and the hidden part is
+ * marked valid for the new selector.
+ */
+static void vmiR3SegSet(PVMCPU pVCpu, PCPUMSELREG pSeg, VMIX86SEG const *pNew, uint32_t fChanged)
+{
+    if (   pSeg->Sel      == pNew->Sel
+        && pSeg->u64Base  == pNew->u64Base
+        && pSeg->u32Limit == pNew->u32Limit)
+        return;
+    pSeg->Sel      = pNew->Sel;
+    pSeg->ValidSel = pNew->Sel;
+    pSeg->fFlags   = CPUMSELREG_FLAGS_VALID;
+    pSeg->u64Base  = pNew->u64Base;
+    pSeg->u32Limit = pNew->u32Limit;
+    CPUMSetChangedFlags(pVCpu, CPUM_CHANGED_HIDDEN_SEL_REGS | fChanged);
+}
+
+
+/**
+ * Writes the registers of the calling EMT's vCPU, the VMI_MSG_REGS_WRITE
+ * worker.
+ *
+ * Running on the vCPU's EMT, the write happens between two guest instructions
+ * of that vCPU, all registers at once.  Nothing is written if a value is
+ * refused.  Registers keeping their value are not touched, so that unchanged
+ * control registers and MSRs have no side effects.  Changes to the paging
+ * registers are propagated to PGM like MOV to CRx does, and HM reloads the
+ * whole state before the next VM-entry.
+ *
+ * @returns VBox status code.
+ * @param   pVM         The cross context VM structure.
+ * @param   pNew        The registers to write.
+ * @thread  The EMT of the vCPU.
+ */
+static DECLCALLBACK(int) vmiR3RegsWriteOnEmt(PVM pVM, VMIX86REGS const *pNew)
+{
+    PVMCPU const  pVCpu    = VMMGetCpu(pVM);
+    VMSTATE const enmState = VMR3GetState(pVM);
+    if (enmState != VMSTATE_RUNNING && enmState != VMSTATE_SUSPENDED)
+        return VERR_VM_INVALID_VM_STATE; /* Saving, teleporting, powering off, ...: the state may be gone already. */
+    CPUM_IMPORT_EXTRN_RET(pVCpu, CPUMCTX_EXTRN_ALL);
+    PCPUMCTX const pCtx = &pVCpu->cpum.GstCtx;
+    if (!vmiR3RegsAreValid(pVM, pCtx, pNew))
+        return VERR_INVALID_PARAMETER;
+
+    /*
+     * What may still fail comes first and is undone on failure: the MSRs, which
+     * WRMSR checks, and mapping the paging structures at the new CR3, before the
+     * mode change, like MOV to CRx.
+     */
+    uint64_t auOld[RT_ELEMENTS(g_aidVmiMsrs)];
+    uint64_t auNew[RT_ELEMENTS(g_aidVmiMsrs)];
+    for (size_t i = 0; i < RT_ELEMENTS(g_aidVmiMsrs); i++)
+        auOld[i] = vmiR3QueryMsr(pVCpu, g_aidVmiMsrs[i]);
+    vmiR3RegsGetMsrValues(pNew, auNew);
+    size_t cMsrsDone = 0;
+    int rc = vmiR3MsrsSet(pVCpu, auOld, auNew, &cMsrsDone);
+
+    uint64_t const uOldEfer       = pCtx->msrEFER;
+    bool const     fModeChanged   = pNew->cr0 != pCtx->cr0 || pNew->cr4 != pCtx->cr4 || pNew->msrEFER != uOldEfer;
+    bool const     fPagingChanged = fModeChanged || pNew->cr3 != pCtx->cr3;
+    if (RT_SUCCESS(rc) && fPagingChanged && CPUMIsPaePagingEnabled(pNew->cr0, pNew->cr4, pNew->msrEFER))
+    {
+        rc = PGMGstMapPaePdpesAtCr3(pVCpu, pNew->cr3);
+        if (rc == VERR_PGM_PAE_PDPE_RSVD) /* MOV to CRx raises #GP */
+            rc = VERR_INVALID_PARAMETER;
+    }
+    if (RT_SUCCESS(rc) && fPagingChanged)
+        rc = PGMFlushTLB(pVCpu, pNew->cr3, true /*fGlobal*/);
+    if (RT_FAILURE(rc))
+    {
+        vmiR3MsrsUndo(pVCpu, auOld, auNew, cMsrsDone);
+        HMNotifyGuestCtxChanged(pVCpu);
+        return rc;
+    }
+
+    /*
+     * The rest cannot fail.
+     */
+    for (unsigned i = 0; i < RT_ELEMENTS(pNew->aGRegs); i++)
+        pCtx->aGRegs[i].u64 = pNew->aGRegs[i];
+    pCtx->rip          = pNew->rip;
+    pCtx->rflags.uBoth = (pCtx->rflags.uBoth & ~CPUMX86EFLAGS_HW_MASK_64) | pNew->rflags;
+
+    vmiR3SegSet(pVCpu, &pCtx->es,   &pNew->es,   0);
+    vmiR3SegSet(pVCpu, &pCtx->cs,   &pNew->cs,   0);
+    vmiR3SegSet(pVCpu, &pCtx->ss,   &pNew->ss,   0);
+    vmiR3SegSet(pVCpu, &pCtx->ds,   &pNew->ds,   0);
+    vmiR3SegSet(pVCpu, &pCtx->fs,   &pNew->fs,   0);
+    vmiR3SegSet(pVCpu, &pCtx->gs,   &pNew->gs,   0);
+    vmiR3SegSet(pVCpu, &pCtx->ldtr, &pNew->ldtr, CPUM_CHANGED_LDTR);
+    vmiR3SegSet(pVCpu, &pCtx->tr,   &pNew->tr,   CPUM_CHANGED_TR);
+    if (pNew->gdtr.u64Base != pCtx->gdtr.pGdt || pNew->gdtr.cbLimit != pCtx->gdtr.cbGdt)
+        CPUMSetGuestGDTR(pVCpu, pNew->gdtr.u64Base, pNew->gdtr.cbLimit);
+    if (pNew->idtr.u64Base != pCtx->idtr.pIdt || pNew->idtr.cbLimit != pCtx->idtr.cbIdt)
+        CPUMSetGuestIDTR(pVCpu, pNew->idtr.u64Base, pNew->idtr.cbLimit);
+
+    if (pNew->cr2 != pCtx->cr2)
+        CPUMSetGuestCR2(pVCpu, pNew->cr2);
+    if (fPagingChanged)
+    {
+        CPUMSetGuestCR0(pVCpu, pNew->cr0);
+        CPUMSetGuestCR4(pVCpu, pNew->cr4);
+        CPUMSetGuestCR3(pVCpu, pNew->cr3);
+        if (pNew->msrEFER != uOldEfer)
+            CPUMSetGuestEferMsrNoChecks(pVCpu, uOldEfer, pNew->msrEFER);
+        if (fModeChanged)
+        {
+            rc = PGMChangeMode(pVCpu, pCtx->cr0, pCtx->cr4, pCtx->msrEFER, false /*fForce*/);
+            if (RT_FAILURE(rc))
+                LogRel(("VMI: Paging mode change of vCPU %u failed: %Rrc\n", pVCpu->idCpu, rc));
+        }
+        HMFlushTlb(pVCpu);
+    }
+    HMNotifyGuestCtxChanged(pVCpu);
+    return RT_FAILURE(rc) ? rc : VINF_SUCCESS;
+}
+
+
+/**
+ * Handles VMI_MSG_REGS_READ and VMI_MSG_REGS_WRITE requests: one request to the
+ * vCPU's EMT, which the server thread waits for.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandleRegs(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    PUVM       pUVM   = pThis->pUVM;
+    bool const fWrite = pHdr->uType == VMI_MSG_REGS_WRITE;
+    VMIVCPUREQ Req;
+    VMIX86REGS Regs;
+    RT_ZERO(Regs);
+    int        rc     = VERR_INVALID_PARAMETER;
+    if (cbBody == sizeof(Req) + (fWrite ? sizeof(Regs) : 0))
+    {
+        uint8_t const *pbBody = (uint8_t const *)pHdr + sizeof(*pHdr);
+        memcpy(&Req, pbBody, sizeof(Req));
+        if (fWrite)
+            memcpy(&Regs, &pbBody[sizeof(Req)], sizeof(Regs));
+        if (Req.u32Reserved || (fWrite && !vmiR3RegsAreReservedZero(&Regs)))
+            rc = VERR_INVALID_PARAMETER;
+        else if (Req.idCpu >= pUVM->cCpus)
+            rc = VERR_INVALID_CPU_ID;
+        else if (fWrite)
+            rc = VMR3ReqCallWaitU(pUVM, Req.idCpu, (PFNRT)vmiR3RegsWriteOnEmt, 2, pUVM->pVM, &Regs);
+        else
+            rc = VMR3ReqCallWaitU(pUVM, Req.idCpu, (PFNRT)vmiR3RegsReadOnEmt, 2, pUVM->pVM, &Regs);
+        Log(("VMI: %s the registers of vCPU %u: %Rrc\n", fWrite ? "Writing" : "Reading", Req.idCpu, rc));
+    }
+    if (RT_SUCCESS(rc))
+        rc = VINF_SUCCESS;
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc,
+                                &Regs, RT_SUCCESS(rc) && !fWrite ? sizeof(Regs) : 0));
+}
+
+#endif /* VBOX_VMM_TARGET_X86 */
+
+
 /**
  * Receives and handles one message from the client.
  *
@@ -648,6 +1009,11 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
             return vmiR3HandlePauseResume(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_VCPU_COUNT:
             return vmiR3HandleVCpuCount(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+#ifdef VBOX_VMM_TARGET_X86
+        case VMI_MSG_REGS_READ:
+        case VMI_MSG_REGS_WRITE:
+            return vmiR3HandleRegs(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+#endif
         default:
             break;
     }

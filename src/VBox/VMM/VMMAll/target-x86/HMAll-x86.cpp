@@ -485,6 +485,25 @@ VMM_INT_DECL(int) HMFlushTlb(PVMCPU pVCpu)
 
 
 /**
+ * Notifies HM that the guest CPU state in CPUMCTX was changed outside the
+ * execution loop, e.g. by an introspection tool, so that all of it is loaded
+ * into the VMCS/VMCB before the next VM-entry.
+ *
+ * Returning to ring-3 flags the whole state as changed, except when it was
+ * for a host interrupt (VINF_EM_RAW_INTERRUPT), after which the EMT may run
+ * ring-3 requests and re-enter the guest without another round trip.
+ *
+ * @param   pVCpu       The cross context virtual CPU structure.
+ * @thread  EMT(pVCpu)
+ */
+VMM_INT_DECL(void) HMNotifyGuestCtxChanged(PVMCPUCC pVCpu)
+{
+    VMCPU_ASSERT_EMT(pVCpu);
+    ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_ALL_GUEST);
+}
+
+
+/**
  * Poke an EMT so it can perform the appropriate TLB shootdowns.
  *
  * @param   pVCpu               The cross context virtual CPU structure of the
