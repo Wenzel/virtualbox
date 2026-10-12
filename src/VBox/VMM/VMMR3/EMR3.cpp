@@ -55,6 +55,10 @@
 #include <VBox/vmm/nem.h>
 #include <VBox/vmm/iom.h>
 #include <VBox/vmm/dbgf.h>
+#ifdef VBOX_WITH_VMI
+# include <VBox/vmm/vmi.h>
+# include "DBGFInternal.h"
+#endif
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/pdmapic.h>
 #include <VBox/vmm/tm.h>
@@ -966,11 +970,34 @@ static VBOXSTRICTRC emR3Debug(PVM pVM, PVMCPU pVCpu, VBOXSTRICTRC rc)
              * Simple events: stepped, breakpoint, stop/assertion.
              */
             case VINF_EM_DBG_STEPPED:
-                rc = DBGFR3Event(pVM, DBGFEVENT_STEPPED);
+#ifdef VBOX_WITH_VMI
+                if (pVCpu->dbgf.s.fVmiStepped)
+                {
+                    if (pVCpu->dbgf.s.fVmiSingleStep)
+                        rc = VMIR3DebugEvent(pVM, pVCpu, VMI_INTERCEPT_SINGLESTEP);
+                    else
+                    {
+                        pVCpu->dbgf.s.fVmiStepped = false;
+                        rc = VINF_EM_RESCHEDULE; /* A step completed just as CLEAR took effect. */
+                    }
+                }
+                else
+#endif
+                    rc = DBGFR3Event(pVM, DBGFEVENT_STEPPED);
                 break;
 
             case VINF_EM_DBG_BREAKPOINT:
-                rc = DBGFR3BpHit(pVM, pVCpu);
+#ifdef VBOX_WITH_VMI
+                if (pVCpu->dbgf.s.fVmiBpHit)
+                {
+                    pVCpu->dbgf.s.fVmiBpHit = false;
+                    rc = pVCpu->dbgf.s.fVmiBreakpoint
+                       ? VMIR3DebugEvent(pVM, pVCpu, VMI_INTERCEPT_BREAKPOINT)
+                       : VINF_EM_RESCHEDULE;
+                }
+                else
+#endif
+                    rc = DBGFR3BpHit(pVM, pVCpu);
                 break;
 
             case VINF_EM_DBG_STOP:

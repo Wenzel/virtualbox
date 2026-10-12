@@ -1,4 +1,4 @@
-# VBoxVMI protocol, version 1
+# VBoxVMI protocol, version 2
 
 VBoxVMI is the virtual machine introspection protocol served by a VirtualBox VM
 process built with `VBOX_WITH_VMI` (see `VBoxVMI-design.md`). The C definitions
@@ -30,7 +30,7 @@ type specific body. Maximum message size: 64 KiB, header included.
 | Offset | Size | Field    | Meaning |
 |-------:|-----:|----------|---------|
 | 0      | 4    | `cbMsg`  | Size of the whole message, header included. Must equal the received size. |
-| 4      | 4    | `idReq`  | Request ID chosen by the client, echoed in the reply. 0 in messages that are not replies (greeting, future events). |
+| 4      | 4    | `idReq`  | Request ID chosen by the client, echoed in the reply. 0 in greeting and asynchronous events. |
 | 8      | 2    | `uType`  | Message type (command or event code). A reply has the type of its request. |
 | 10     | 2    | `fFlags` | Bit 0 `VMI_MSG_F_REPLY`: the message is a reply. Other bits are 0. |
 | 12     | 4    | `rc`     | VirtualBox status code (`iprt/err.h`, `VBox/err.h`): the result in replies and in the greeting, 0 in requests. |
@@ -39,9 +39,9 @@ Requests have `fFlags` and `rc` zero. A request whose header is malformed
 (size mismatch, nonzero `fFlags` or `rc`, larger than 64 KiB) is a protocol
 error: the server drops the connection without replying.
 
-Client IDs are not interpreted by the server; using a fresh nonzero ID per
-request lets replies (and, in a later version, events with `idReq` 0) share the
-connection.
+Client IDs are not interpreted by the server; use a fresh nonzero ID per
+request. Events with `idReq` 0 can arrive between replies on the same ordered
+connection. An event has `fFlags` and `rc` zero.
 
 ### Message types
 
@@ -56,6 +56,10 @@ connection.
 | `0x0007` | `VMI_MSG_REGS_READ` | see Registers | 1 |
 | `0x0008` | `VMI_MSG_REGS_WRITE` | see Registers | 1 |
 | `0x0009` | `VMI_MSG_PHYS_WRITE` | see Physical memory write | 1 |
+| `0x000a` | `VMI_MSG_INTERCEPT_SET` | `VMIINTERCEPT` | 2 |
+| `0x000b` | `VMI_MSG_INTERCEPT_CLEAR` | `VMIINTERCEPT` | 2 |
+| `0x000c` | `VMI_MSG_EVENT_REPLY` | `VMIEVENTREPLY` | 2 |
+| `0x000d` | `VMI_MSG_EVENT` | `VMIEVENT` (server to client only) | 2 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -67,7 +71,7 @@ the connection stays up.
 | Offset | Size | Field        | Value |
 |-------:|-----:|--------------|-------|
 | 0      | 4    | `u32Magic`   | `0x494d5642`, the bytes `"BVMI"` |
-| 4      | 4    | `u32Version` | Protocol version of the sender, `1` |
+| 4      | 4    | `u32Version` | Protocol version of the sender, `2` |
 
 1. **Greeting.** Right after accepting, the server sends `VMI_MSG_HELLO` with
    `idReq` 0, `fFlags` 0, its own magic and version, and `rc`:
@@ -222,8 +226,8 @@ synchronously resumes such a client-owned pause before ending the session.
 A pause by someone else is never resumed: this includes a VM paused before the
 client's no-op pause, and an external pause after someone resumed the client's
 pause. If power-off or destruction has already made resume impossible, cleanup
-logs the failure and ends without changing that transition. Future per-client
-intercepts are removed at the same session-cleanup point.
+logs the failure and ends without changing that transition. Intercepts and
+parked vCPUs are cleaned up first.
 
 ## vCPU count
 
@@ -322,6 +326,60 @@ Reply `rc`, with the connection kept:
 - `VERR_NOT_SUPPORTED` (-37): not an x86 VM;
 - another VirtualBox status if the vCPU could not be reached.
 
+## Intercepts and events
+
+`VMI_MSG_INTERCEPT_SET` and `VMI_MSG_INTERCEPT_CLEAR` have an 8-byte
+`VMIINTERCEPT` request body: `u32 idCpu` at offset 0, `u32 uKind` at offset
+4. Kind 1 is `VMI_INTERCEPT_BREAKPOINT` (#BP from an int3); kind 2 is
+`VMI_INTERCEPT_SINGLESTEP`. Their replies have empty bodies. Setting an
+already-set intercept or clearing an unset intercept succeeds. These commands
+work while running or paused, including before replying to that vCPU's event.
+SET returns `VERR_DBGF_ALREADY_ATTACHED` (-1201) if the VirtualBox debugger
+is attached. CLEAR still works. Both return `VERR_INVALID_PARAMETER` (-2) for
+a wrong body size, `VERR_INVALID_CPU_ID` (-1018) for an unknown vCPU, or
+`VERR_NOT_SUPPORTED` (-37) for an unknown kind or a non-x86 VM. Single-step
+SET also returns -37 unless the VM runs on VT-x with the monitor trap flag;
+AMD-V and NEM stepping would alter guest-visible debug state and are refused.
+While any intercept is set, the VirtualBox debugger cannot attach
+(`VERR_DBGF_VMI_INTERCEPTS_ACTIVE`, -1242).
+
+`VMI_MSG_EVENT` is unsolicited from server to client: header `idReq` 0,
+`fFlags` 0, `rc` 0; body `VMIEVENT` is 24 bytes: `u32 idCpu` at 0,
+`u32 uKind` at 4, `u64 GCPhys` at 8, `u32 cbInstr` at 16, and reserved
+`u32` zero at 20. Events from different vCPUs are sent in occurrence order.
+Each vCPU has at most one outstanding event; the others continue executing.
+
+- Breakpoint event (kind 1): `GCPhys` is the guest-physical address of the
+  int3, `cbInstr` its instruction length. RIP is at the int3. A reply without
+  reinjection re-executes from RIP, typically after the client restores the
+  original instruction; a reply with reinjection delivers #BP to the guest
+  with its return address after the int3.
+- Single-step event (kind 2): `GCPhys` is the guest-physical address of the
+  next instruction (at RIP); `cbInstr` is zero. Steps occur at instruction
+  boundaries including the first instruction of an interrupt or exception
+  handler. Interrupts are not masked; an intercepted int3 encountered while
+  stepping reports the breakpoint before a step.
+- If RIP is not mapped by the guest's page tables (e.g. a step onto a page
+  the guest has not faulted in yet), `GCPhys` is `0xffffffffffffffff`.
+
+The event's vCPU is **Parked** until a reply, but continues to serve register
+requests for itself and VM-wide pause/resume operations. It stays Parked
+across pause and resume. Memory operations and requests for other vCPUs work
+normally. `VMI_MSG_EVENT_REPLY` has an 8-byte `VMIEVENTREPLY` request body:
+`u32 idCpu` at 0 and `u32 fFlags` at 4. Bit 0
+`VMI_EVENT_REPLY_F_REINJECT` requests breakpoint reinjection; all other bits
+must be zero. Reply body is empty. A reply while paused succeeds and the vCPU
+continues after resume. Errors leave the vCPU Parked:
+
+- `VERR_INVALID_PARAMETER` (-2): wrong body size, unknown flags, or
+  reinjection requested for a single-step event;
+- `VERR_INVALID_CPU_ID` (-1018): unknown vCPU;
+- `VERR_INVALID_STATE` (-79): vCPU not Parked, including a second reply.
+
+Disconnect clears every intercept, stops stepping, releases all Parked vCPUs
+without reinjection, and then releases any client-owned pause. A breakpoint
+byte the client left in guest memory is not removed by the server.
+
 ## Disconnecting
 
 Either side may close the socket at any time. The server then accepts the next
@@ -331,3 +389,6 @@ client.
 
 - Version 1: transport, header and handshake; physical memory read and write
   and RAM ranges; pause, resume and vCPU count; registers.
+- Version 2: per-vCPU breakpoint and VT-x single-step intercepts, ordered
+  asynchronous events, parked vCPUs and explicit breakpoint reinjection.
+  Version 1 greetings are refused with `VERR_VERSION_MISMATCH` (-11).

@@ -45,11 +45,17 @@
 #include <VBox/vmm/vmi.h>
 #include <VBox/vmm/cfgm.h>
 #include <VBox/vmm/cpum.h>
+#include <VBox/vmm/em.h>
 #include <VBox/vmm/hm.h>
 #include <VBox/vmm/mm.h>
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/vmm.h>
+#include "PGMInternal.h"
+#include "DBGFInternal.h"
+#include "HMInternal.h"
+#include "VMInternal.h"
 #include <VBox/vmm/vm.h>
+#include <VBox/vmm/trpm.h>
 #include <VBox/vmm/uvm.h>
 #include <VBox/err.h>
 #include <VBox/log.h>
@@ -63,7 +69,6 @@
 #include <iprt/thread.h>
 #include <iprt/time.h>
 
-#include "PGMInternal.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -93,6 +98,24 @@
 *   Structures and Typedefs                                                                                                      *
 *********************************************************************************************************************************/
 /**
+ * Event state of one vCPU, changed only on that vCPU's EMT.
+ */
+typedef struct VMIR3CPU
+{
+    /** Set while the vCPU waits for the reply to its event. */
+    bool        fParked;
+    /** Set by the reply: deliver the intercepted #BP to the guest. */
+    bool        fReinject;
+    /** The event's kind, VMI_INTERCEPT_XXX. */
+    uint32_t    uKind;
+    /** Instruction length of the intercepted int3. */
+    uint32_t    cbInstr;
+} VMIR3CPU;
+/** Pointer to the event state of one vCPU. */
+typedef VMIR3CPU *PVMIR3CPU;
+
+
+/**
  * The VBoxVMI server instance.
  */
 typedef struct VMIR3
@@ -112,10 +135,24 @@ typedef struct VMIR3
      *  under hMtxClient so that VMIR3Terminate can shut it down. */
     int             fdClient;
     RTSEMFASTMUTEX  hMtxClient;
-    /** Pipe for waking up the server thread on termination: [0] read, [1] write. */
+    /** Protects the pending events and their occurrence ordering. */
+    RTSEMFASTMUTEX  hMtxEvents;
+    /** Ring of events not yet sent, at most one per vCPU, so cCpus entries. */
+    VMIEVENT       *paEvents;
+    /** Ring index of the oldest pending event. */
+    uint32_t        iEventRead;
+    /** Ring index of the next event. */
+    uint32_t        iEventWrite;
+    /** Number of pending events. */
+    uint32_t        cEvents;
+    /** Per-vCPU event state, cCpus entries. */
+    PVMIR3CPU       paCpus;
+    /** Distinguishes an event wakeup from termination on the same pipe. */
+    bool volatile   fTerminating;
+    /** Pipe for waking the server on an event or termination: [0] read, [1] write. */
     int             afdWakeup[2];
     /** Set when the client completed the handshake. */
-    bool            fHandshaked;
+    bool volatile   fHandshaked;
     /** Set when a VMI_MSG_PAUSE of the connected client suspended the VM (not
      *  one that found it suspended already).  Cleared by the client's
      *  VMI_MSG_RESUME and when the session ends.  The VM is still suspended by
@@ -262,16 +299,74 @@ static DECLCALLBACK(int) vmiR3ResumeCheckOnEmt(PUVM pUVM, void *pvUser)
     return VERR_CANCELLED;
 }
 
+#ifdef VBOX_VMM_TARGET_X86
+/** Changes an intercept on its vCPU's EMT, serialized with debugger attach. */
+static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, bool fSet)
+{
+    PVMCPU pVCpu = VMMGetCpu(pVM);
+    bool *pfIntercept = uKind == VMI_INTERCEPT_BREAKPOINT ? &pVCpu->dbgf.s.fVmiBreakpoint
+                                                         : &pVCpu->dbgf.s.fVmiSingleStep;
+    if (*pfIntercept == fSet)
+        return VINF_SUCCESS;
+    if (fSet && pVM->dbgf.s.fAttached)
+        return VERR_DBGF_ALREADY_ATTACHED;
+    if (fSet && uKind == VMI_INTERCEPT_SINGLESTEP
+        && (   !HMR3IsVmxEnabled(pVM->pUVM)
+            || !(pVM->hm.s.ForR3.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG)))
+        return VERR_NOT_SUPPORTED;
+    *pfIntercept = fSet;
+    if (fSet)
+        ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts);
+    else
+        ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
+    if (uKind == VMI_INTERCEPT_BREAKPOINT)
+    {
+        if (fSet)
+            ASMAtomicIncU32(&pVM->dbgf.s.cVmiBreakpoints);
+        else
+            ASMAtomicDecU32(&pVM->dbgf.s.cVmiBreakpoints);
+    }
+    else
+    {
+        pVCpu->dbgf.s.fSingleSteppingRaw = fSet;
+        if (fSet)
+            pVCpu->dbgf.s.fVmiStepped = true;
+    }
+    return VINF_SUCCESS;
+}
+#endif /* VBOX_VMM_TARGET_X86 */
+
+
+/** Releases a parked EMT and removes its intercepts during disconnect. */
+static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
+{
+#ifdef VBOX_VMM_TARGET_X86
+    PVMCPU pVCpu = VMMGetCpu(pVM);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_BREAKPOINT, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_SINGLESTEP, false);
+    pThis->paCpus[pVCpu->idCpu].fParked = false;
+#else
+    RT_NOREF(pVM, pThis);
+#endif
+    return VINF_SUCCESS;
+}
+
 
 /**
- * Undoes state owned by the connected client.
- *
- * This is the single cleanup point for a session.  Future per-client
- * intercept ownership must be released here before the session state is
- * discarded.
+ * Removes intercepts, releases parked vCPUs, then undoes the client's pause.
  */
 static void vmiR3CleanupSession(PVMIR3 pThis)
 {
+    for (uint32_t idCpu = 0; idCpu < pThis->pUVM->cCpus; idCpu++)
+    {
+        int rc = VMR3ReqCallWaitU(pThis->pUVM, idCpu, (PFNRT)vmiR3ClearOnEmt, 2, pThis->pUVM->pVM, pThis);
+        if (RT_FAILURE(rc))
+            LogRel(("VMI: Cannot clean up vCPU %u: %Rrc\n", idCpu, rc));
+    }
+    RTSemFastMutexRequest(pThis->hMtxEvents);
+    pThis->cEvents = 0;
+    pThis->iEventRead = pThis->iEventWrite;
+    RTSemFastMutexRelease(pThis->hMtxEvents);
     if (vmiR3IsPausedByClient(pThis))
     {
         VMIR3RESUMECHECK Check;
@@ -299,7 +394,7 @@ static void vmiR3Disconnect(PVMIR3 pThis)
     close(pThis->fdClient);
     pThis->fdClient = -1;
     RTSemFastMutexRelease(pThis->hMtxClient);
-    pThis->fHandshaked = false;
+    ASMAtomicWriteBool(&pThis->fHandshaked, false);
 }
 
 
@@ -356,7 +451,7 @@ static void vmiR3Accept(PVMIR3 pThis)
         RTSemFastMutexRequest(pThis->hMtxClient);
         pThis->fdClient = fd;
         RTSemFastMutexRelease(pThis->hMtxClient);
-        pThis->fHandshaked = false;
+        ASMAtomicWriteBool(&pThis->fHandshaked, false);
     }
     else
         close(fd);
@@ -388,7 +483,7 @@ static bool vmiR3HandleHello(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
     LogRel(("VMI: Handshake: client magic %#x version %u: %Rrc\n", Hello.u32Magic, Hello.u32Version, rcReply));
 
     int rc = vmiR3SendHello(pThis->fdClient, pHdr->idReq, VMI_MSG_F_REPLY, rcReply);
-    pThis->fHandshaked = RT_SUCCESS(rc) && RT_SUCCESS(rcReply);
+    ASMAtomicWriteBool(&pThis->fHandshaked, RT_SUCCESS(rc) && RT_SUCCESS(rcReply));
     return pThis->fHandshaked;
 }
 
@@ -1131,6 +1226,179 @@ static bool vmiR3HandleRegs(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 
 #endif /* VBOX_VMM_TARGET_X86 */
 
+/** Accepts an event reply on the parked vCPU's EMT. */
+static DECLCALLBACK(int) vmiR3ReplyOnEmt(PVM pVM, PVMIR3 pThis, uint32_t fFlags)
+{
+    PVMCPU pVCpu = VMMGetCpu(pVM);
+    uint32_t const idCpu = pVCpu->idCpu;
+    if (!pThis->paCpus[idCpu].fParked)
+        return VERR_INVALID_STATE;
+    if ((fFlags & VMI_EVENT_REPLY_F_REINJECT) && pThis->paCpus[idCpu].uKind != VMI_INTERCEPT_BREAKPOINT)
+        return VERR_INVALID_PARAMETER;
+    pThis->paCpus[idCpu].fReinject = RT_BOOL(fFlags & VMI_EVENT_REPLY_F_REINJECT);
+    pThis->paCpus[idCpu].fParked = false;
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Wakes the server thread up, for an event or termination.
+ */
+static void vmiR3Wakeup(PVMIR3 pThis)
+{
+    char ch = 0;
+    ssize_t cbWritten;
+    do
+        cbWritten = write(pThis->afdWakeup[1], &ch, 1);
+    while (cbWritten < 0 && errno == EINTR);
+    /* EAGAIN: the pipe is full, so a wakeup is pending already. */
+    if (cbWritten < 0 && errno != EAGAIN)
+        LogRel(("VMI: Cannot wake the server thread up: errno=%d\n", errno));
+}
+
+
+/**
+ * Reports a VBoxVMI event and parks the calling EMT until the client replies.
+ *
+ * Called by EM's debug loop on the event's EMT.  The parked EMT still serves
+ * its own requests and VM-wide rendezvous (pause and resume included, the vCPU
+ * staying parked), until the reply, the end of the session or VM termination.
+ *
+ * @returns Strict VBox status code for EM: VINF_EM_RESCHEDULE or
+ *          VINF_EM_SUSPEND to continue, or the status ending the park
+ *          (VINF_EM_OFF, VINF_EM_RESET, VINF_EM_TERMINATE, failure).
+ * @param   pVM     The cross context VM structure.
+ * @param   pVCpu   The cross context virtual CPU structure of the calling EMT.
+ * @param   uKind   The event kind, VMI_INTERCEPT_BREAKPOINT or VMI_INTERCEPT_SINGLESTEP.
+ */
+VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKind)
+{
+    PVMIR3 pThis = (PVMIR3)pVM->pUVM->vm.s.pvVMI;
+    if (!pThis || !pThis->fHandshaked)
+        return VINF_EM_RESCHEDULE;
+
+    VMIEVENT Event;
+    RT_ZERO(Event);
+    Event.idCpu = pVCpu->idCpu;
+    Event.uKind = uKind;
+    /* An unmapped RIP (a step onto a page not faulted in yet) is reported, not fatal to EM. */
+    int rc = PGMPhysGCPtr2GCPhys(pVCpu, CPUMGetGuestFlatPC(pVCpu), &Event.GCPhys);
+    if (RT_FAILURE(rc))
+        Event.GCPhys = NIL_RTGCPHYS;
+    if (uKind == VMI_INTERCEPT_BREAKPOINT)
+    {
+        DISSTATE Dis;
+        unsigned cbInstr;
+        rc = EMInterpretDisasCurrent(pVCpu, &Dis, &cbInstr);
+        /* shortcut: assumes the one-byte 0xcc if the int3 can't be decoded again (it just executed). */
+        Event.cbInstr = RT_SUCCESS(rc) ? cbInstr : 1;
+    }
+
+    uint32_t const idCpu = pVCpu->idCpu;
+    pThis->paCpus[idCpu].uKind = uKind;
+    pThis->paCpus[idCpu].cbInstr = Event.cbInstr;
+    pThis->paCpus[idCpu].fReinject = false;
+    pThis->paCpus[idCpu].fParked = true;
+    RTSemFastMutexRequest(pThis->hMtxEvents);
+    Assert(pThis->cEvents < pVM->cCpus);
+    pThis->paEvents[pThis->iEventWrite] = Event;
+    pThis->iEventWrite = (pThis->iEventWrite + 1) % pVM->cCpus;
+    pThis->cEvents++;
+    RTSemFastMutexRelease(pThis->hMtxEvents);
+    vmiR3Wakeup(pThis);
+
+    while (pThis->paCpus[idCpu].fParked)
+    {
+        if (VM_FF_IS_SET(pVM, VM_FF_EMT_RENDEZVOUS))
+            rc = VMMR3EmtRendezvousFF(pVM, pVCpu);
+        else if (VM_FF_IS_SET(pVM, VM_FF_REQUEST) || VMCPU_FF_IS_SET(pVCpu, VMCPU_FF_REQUEST))
+        {
+            rc = VMR3ReqProcessU(pVM->pUVM, VMCPUID_ANY, false /*fPriorityOnly*/);
+            if (rc == VINF_SUCCESS)
+                rc = VMR3ReqProcessU(pVM->pUVM, idCpu, false /*fPriorityOnly*/);
+        }
+        else if (VMR3GetState(pVM) >= VMSTATE_POWERING_OFF)
+            rc = VINF_EM_OFF;
+        else
+        {
+            rc = VMR3WaitU(pVCpu->pUVCpu);
+            if (RT_SUCCESS(rc))
+                continue;
+        }
+        if (   rc == VINF_EM_RESET
+            || rc == VINF_EM_OFF
+            || rc == VINF_EM_TERMINATE
+            || RT_FAILURE(rc))
+        {
+            pThis->paCpus[idCpu].fParked = false;
+            return rc;
+        }
+    }
+
+    if (pThis->paCpus[idCpu].fReinject)
+    {
+        rc = TRPMAssertTrap(pVCpu, X86_XCPT_BP, TRPM_SOFTWARE_INT);
+        if (RT_FAILURE(rc))
+            return rc;
+        TRPMSetInstrLength(pVCpu, (uint8_t)pThis->paCpus[idCpu].cbInstr);
+    }
+    /* Suspended meanwhile, live save or snapshot included: the vCPU continues on resume. */
+    switch (VMR3GetState(pVM))
+    {
+        case VMSTATE_SUSPENDED:
+        case VMSTATE_SUSPENDED_LS:
+        case VMSTATE_SUSPENDED_EXT_LS:
+            return VINF_EM_SUSPEND;
+        default:
+            return VINF_EM_RESCHEDULE;
+    }
+}
+
+
+/** Sets or clears one intercept; CPU-local changes run on its EMT. */
+static bool vmiR3HandleIntercept(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    VMIINTERCEPT Req;
+    int rc = cbBody == sizeof(Req) ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
+    if (RT_SUCCESS(rc))
+    {
+        memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
+        if (Req.idCpu >= pThis->pUVM->cCpus)
+            rc = VERR_INVALID_CPU_ID;
+        else if (Req.uKind != VMI_INTERCEPT_BREAKPOINT && Req.uKind != VMI_INTERCEPT_SINGLESTEP)
+            rc = VERR_NOT_SUPPORTED;
+#ifdef VBOX_VMM_TARGET_X86
+        else
+            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3InterceptOnEmt, 3,
+                                  pThis->pUVM->pVM, Req.uKind, pHdr->uType == VMI_MSG_INTERCEPT_SET);
+#else
+        else
+            rc = VERR_NOT_SUPPORTED;
+#endif
+    }
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
+}
+
+
+/** Validates the reply before releasing its parked EMT. */
+static bool vmiR3HandleEventReply(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    VMIEVENTREPLY Req;
+    int rc = cbBody == sizeof(Req) ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
+    if (RT_SUCCESS(rc))
+    {
+        memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
+        if (Req.fFlags & ~VMI_EVENT_REPLY_F_REINJECT)
+            rc = VERR_INVALID_PARAMETER;
+        else if (Req.idCpu >= pThis->pUVM->cCpus)
+            rc = VERR_INVALID_CPU_ID;
+        else
+            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3ReplyOnEmt, 3,
+                                  pThis->pUVM->pVM, pThis, Req.fFlags);
+    }
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
+}
+
 
 /**
  * Receives and handles one message from the client.
@@ -1174,6 +1442,11 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
     }
     switch (Hdr.uType)
     {
+        case VMI_MSG_INTERCEPT_SET:
+        case VMI_MSG_INTERCEPT_CLEAR:
+            return vmiR3HandleIntercept(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_EVENT_REPLY:
+            return vmiR3HandleEventReply(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_PHYS_READ:
             return vmiR3HandlePhysRead(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_PHYS_WRITE:
@@ -1194,6 +1467,28 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
             break;
     }
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, Hdr.idReq, Hdr.uType, VMI_MSG_F_REPLY, VERR_NOT_SUPPORTED, NULL, 0));
+}
+
+
+/** Only the server thread writes the socket, in event occurrence order. */
+static bool vmiR3SendEvents(PVMIR3 pThis)
+{
+    for (;;)
+    {
+        VMIEVENT Event;
+        RTSemFastMutexRequest(pThis->hMtxEvents);
+        if (!pThis->cEvents)
+        {
+            RTSemFastMutexRelease(pThis->hMtxEvents);
+            return true;
+        }
+        Event = pThis->paEvents[pThis->iEventRead];
+        pThis->iEventRead = (pThis->iEventRead + 1) % pThis->pUVM->cCpus;
+        pThis->cEvents--;
+        RTSemFastMutexRelease(pThis->hMtxEvents);
+        if (RT_FAILURE(vmiR3Send(pThis->fdClient, 0, VMI_MSG_EVENT, 0, VINF_SUCCESS, &Event, sizeof(Event))))
+            return false;
+    }
 }
 
 
@@ -1241,8 +1536,17 @@ static DECLCALLBACK(int) vmiR3Thread(RTTHREAD hThreadSelf, void *pvUser)
         }
 
         if (aFds[0].revents)
-            break; /* VMIR3Terminate */
+        {
+            char abWake[64];
+            while (read(pThis->afdWakeup[0], abWake, sizeof(abWake)) > 0)
+                { /* Drain the nonblocking pipe. */ }
+            if (ASMAtomicReadBool(&pThis->fTerminating))
+                break;
+            if (pThis->fdClient >= 0 && !vmiR3SendEvents(pThis))
+                vmiR3Disconnect(pThis);
+        }
         if (   aFds[2].revents
+            && pThis->fdClient >= 0 /* not disconnected by a failed event send */
             && !vmiR3HandleMsg(pThis))
             vmiR3Disconnect(pThis);
         if (aFds[1].revents)
@@ -1408,6 +1712,7 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     pThis->fdListen     = -1;
     pThis->fdClient     = -1;
     pThis->hMtxClient   = NIL_RTSEMFASTMUTEX;
+    pThis->hMtxEvents   = NIL_RTSEMFASTMUTEX;
     pThis->afdWakeup[0] = -1;
     pThis->afdWakeup[1] = -1;
 
@@ -1418,8 +1723,17 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     if (RT_SUCCESS(rc))
         rc = RTSemFastMutexCreate(&pThis->hMtxClient);
     if (RT_SUCCESS(rc))
+        rc = RTSemFastMutexCreate(&pThis->hMtxEvents);
+    if (RT_SUCCESS(rc))
+    {
+        pThis->paEvents = (VMIEVENT *)RTMemAllocZ(pUVM->cCpus * sizeof(*pThis->paEvents));
+        pThis->paCpus = (PVMIR3CPU)RTMemAllocZ(pUVM->cCpus * sizeof(*pThis->paCpus));
+        if (!pThis->paEvents || !pThis->paCpus)
+            rc = VERR_NO_MEMORY;
+    }
+    if (RT_SUCCESS(rc))
         rc = vmiR3Listen(pThis);
-    if (RT_SUCCESS(rc) && pipe2(pThis->afdWakeup, O_CLOEXEC) != 0)
+    if (RT_SUCCESS(rc) && pipe2(pThis->afdWakeup, O_CLOEXEC | O_NONBLOCK) != 0)
         rc = VM_SET_ERROR_U(pUVM, RTErrConvertFromErrno(errno), "VMI: pipe2 failed");
     if (RT_SUCCESS(rc))
     {
@@ -1428,15 +1742,17 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     }
     if (RT_SUCCESS(rc))
     {
+        /* EMTs may raise an event as soon as the server accepts a client. */
+        *ppvVmi = pThis;
         rc = RTThreadCreate(&pThis->hThread, vmiR3Thread, pThis, 0 /*cbStack*/, RTTHREADTYPE_IO,
                             RTTHREADFLAGS_WAITABLE, "VMI");
         if (RT_SUCCESS(rc))
         {
             LogRel(("VMI: Listening on %s\n", pThis->pszPath));
-            *ppvVmi = pThis;
             return VINF_SUCCESS;
         }
         pThis->hThread = NIL_RTTHREAD;
+        *ppvVmi = NULL;
         rc = VM_SET_ERROR_U(pUVM, rc, "VMI: Failed to create the server thread");
     }
 
@@ -1464,11 +1780,8 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
 
     if (pThis->hThread != NIL_RTTHREAD)
     {
-        char ch = 0;
-        ssize_t cbWritten;
-        do
-            cbWritten = write(pThis->afdWakeup[1], &ch, 1);
-        while (cbWritten < 0 && errno == EINTR);
+        ASMAtomicWriteBool(&pThis->fTerminating, true);
+        vmiR3Wakeup(pThis);
 
         /* Unblock a send to or recv from the client. */
         RTSemFastMutexRequest(pThis->hMtxClient);
@@ -1508,6 +1821,10 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
     if (pThis->afdWakeup[1] >= 0)
         close(pThis->afdWakeup[1]);
     RTSemFastMutexDestroy(pThis->hMtxClient);
+    if (pThis->hMtxEvents != NIL_RTSEMFASTMUTEX)
+        RTSemFastMutexDestroy(pThis->hMtxEvents);
+    RTMemFree(pThis->paEvents);
+    RTMemFree(pThis->paCpus);
     MMR3HeapFree(pThis->pszPath);
     RTMemFree(pThis);
 }

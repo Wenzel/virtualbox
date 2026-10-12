@@ -5290,6 +5290,7 @@ static VBOXSTRICTRC nemHCWinRunGC(PVMCC pVM, PVMCPUCC pVCpu)
     pVCpu->nem.s.fGuestDebug            =  pVCpu->nem.s.fUseDebugLoop
                                         || fSingleStepping
                                         || pVM->dbgf.ro.cEnabledSwBreakpoints
+                                        || pVM->dbgf.ro.cVmiBreakpoints
                                         || pVM->dbgf.ro.cEnabledHwBreakpoints;
 
     /* Make sure the hypervisor debug register values are up to date. */

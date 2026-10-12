@@ -1117,6 +1117,10 @@ typedef struct DBGF
     uint8_t                     au8Alignment1[2]; /**< Alignment padding. */
     /** The number of enabled software breakpoints. */
     uint32_t volatile           cEnabledSwBreakpoints;
+    /** VBoxVMI intercepts, serialized with debugger attach on EMTs. */
+    uint32_t volatile           cVmiIntercepts;
+    /** VBoxVMI breakpoint intercepts requiring #BP exits. */
+    uint32_t volatile           cVmiBreakpoints;
 
     /** Debugger Attached flag.
      * Set if a debugger is attached, elsewise it's clear.
@@ -1285,6 +1289,14 @@ typedef struct DBGFCPU
         /** Alignment padding. */
         uint32_t            u32Alignment;
     } aEvents[3];
+    /** VBoxVMI breakpoint intercept set on this vCPU (by VMIR3, on this EMT). */
+    bool                    fVmiBreakpoint;
+    /** VBoxVMI single-step intercept set on this vCPU (by VMIR3, on this EMT). */
+    bool                    fVmiSingleStep;
+    /** The pending VINF_EM_DBG_BREAKPOINT is VBoxVMI's, not a DBGF breakpoint's. */
+    bool                    fVmiBpHit;
+    /** Raw stepping is VBoxVMI's: VINF_EM_DBG_STEPPED goes to VMIR3, not DBGF. */
+    bool                    fVmiStepped;
 } DBGFCPU;
 AssertCompileMemberAlignment(DBGFCPU, aEvents, 8);
 AssertCompileMemberSizeAlignment(DBGFCPU, aEvents[0], 8);

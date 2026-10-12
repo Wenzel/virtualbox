@@ -2075,7 +2075,7 @@ static int nemR3LnxGstDbgUpdate(PVM pVM, PVMCPU pVCpu, bool fSingleStepping, boo
         GstDbg.control |= KVM_GUESTDBG_INJECT_DB;
     if (fInjectBp)
         GstDbg.control |= KVM_GUESTDBG_INJECT_BP;
-    if (pVM->dbgf.ro.cEnabledSwBreakpoints)
+    if (pVM->dbgf.ro.cEnabledSwBreakpoints || pVM->dbgf.ro.cVmiBreakpoints)
         GstDbg.control |= KVM_GUESTDBG_USE_SW_BP;
 
     if ((CPUMGetHyperDR7(pVCpu) & X86_DR7_ENABLED_MASK))
@@ -2349,6 +2349,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
     const bool              fGstDbg             =    pVCpu->nem.s.fUseDebugLoop
                                                   || fSingleStepping
                                                   || pVM->dbgf.ro.cEnabledSwBreakpoints
+                                                  || pVM->dbgf.ro.cVmiBreakpoints
                                                   || pVM->dbgf.ro.cEnabledHwBreakpoints;
 
     /* Make sure the hypervisor debug register values are up to date. */

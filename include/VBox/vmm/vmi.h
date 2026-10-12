@@ -57,7 +57,7 @@ RT_C_DECLS_BEGIN
 /** Protocol magic, the bytes "BVMI" on the wire. */
 #define VMI_MAGIC                   UINT32_C(0x494d5642)
 /** Protocol version.  Client and server must match exactly. */
-#define VMI_VERSION                 UINT32_C(1)
+#define VMI_VERSION                 UINT32_C(2)
 /** Maximum size of a message, header included. */
 #define VMI_MSG_SIZE_MAX            _64K
 
@@ -94,6 +94,16 @@ RT_C_DECLS_BEGIN
  *  Reply body: an int32_t VBox status per guest page each range overlaps
  *  (in request order). */
 #define VMI_MSG_PHYS_WRITE          UINT16_C(0x0009)
+/** Set a per-vCPU intercept (idempotent). Request body: VMIINTERCEPT.
+ *  Reply body: empty. */
+#define VMI_MSG_INTERCEPT_SET       UINT16_C(0x000a)
+/** Clear a per-vCPU intercept (idempotent). Request body: VMIINTERCEPT.
+ *  Reply body: empty. */
+#define VMI_MSG_INTERCEPT_CLEAR     UINT16_C(0x000b)
+/** Release a parked vCPU. Request body: VMIEVENTREPLY. Reply body: empty. */
+#define VMI_MSG_EVENT_REPLY         UINT16_C(0x000c)
+/** Asynchronous event, server to client, request ID zero. Body: VMIEVENT. */
+#define VMI_MSG_EVENT               UINT16_C(0x000d)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -173,6 +183,55 @@ typedef struct VMIVCPUREQ
 } VMIVCPUREQ;
 AssertCompileSize(VMIVCPUREQ, 8);
 
+/** Intercept and event kind: an int3 (#BP) the vCPU executes. */
+#define VMI_INTERCEPT_BREAKPOINT    UINT32_C(1)
+/** Intercept and event kind: every instruction boundary of the vCPU. */
+#define VMI_INTERCEPT_SINGLESTEP    UINT32_C(2)
+/**
+ * Request body of VMI_MSG_INTERCEPT_SET and VMI_MSG_INTERCEPT_CLEAR.
+ */
+typedef struct VMIINTERCEPT
+{
+    /** vCPU number, below the VMI_MSG_VCPU_COUNT count. */
+    uint32_t idCpu;
+    /** The intercept, VMI_INTERCEPT_XXX. */
+    uint32_t uKind;
+} VMIINTERCEPT;
+AssertCompileSize(VMIINTERCEPT, 8);
+
+/** VMIEVENTREPLY::fFlags: deliver the intercepted #BP to the guest (breakpoint events only). */
+#define VMI_EVENT_REPLY_F_REINJECT  UINT32_C(1)
+/**
+ * Request body of VMI_MSG_EVENT_REPLY.
+ */
+typedef struct VMIEVENTREPLY
+{
+    /** The parked vCPU. */
+    uint32_t idCpu;
+    /** VMI_EVENT_REPLY_F_XXX, other bits zero. */
+    uint32_t fFlags;
+} VMIEVENTREPLY;
+AssertCompileSize(VMIEVENTREPLY, 8);
+
+/**
+ * Body of VMI_MSG_EVENT.
+ */
+typedef struct VMIEVENT
+{
+    /** The vCPU, parked until VMI_MSG_EVENT_REPLY. */
+    uint32_t idCpu;
+    /** The event, VMI_INTERCEPT_XXX. */
+    uint32_t uKind;
+    /** Guest-physical address of the instruction at RIP (the int3, or the next
+     *  one to step), NIL_RTGCPHYS if RIP is not mapped. */
+    uint64_t GCPhys;
+    /** Instruction length of the int3; zero for a single step. */
+    uint32_t cbInstr;
+    /** Reserved, zero. */
+    uint32_t u32Reserved;
+} VMIEVENT;
+AssertCompileSize(VMIEVENT, 24);
+
 /**
  * A segment register in VMIX86REGS: the selector and its hidden base and
  * limit.  The attributes are not part of it, writes leave them unchanged.
@@ -251,6 +310,7 @@ AssertCompileSize(VMIX86REGS, 392);
 #ifdef IN_RING3
 VMMR3_INT_DECL(int)  VMIR3Create(PUVM pUVM, void **ppvVmi);
 VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi);
+VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKind);
 #endif
 
 /** @} */

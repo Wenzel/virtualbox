@@ -1597,6 +1597,10 @@ typedef struct VM
             uint8_t                     au8Alignment1[2]; /**< Alignment padding. */
             /** The number of enabled software breakpoints. */
             uint32_t volatile           cEnabledSwBreakpoints;
+            /** VBoxVMI intercepts, serialized with debugger attach on EMTs. */
+            uint32_t volatile           cVmiIntercepts;
+            /** VBoxVMI breakpoint intercepts requiring #BP exits. */
+            uint32_t volatile           cVmiBreakpoints;
         } const     ro;
 #endif
         uint8_t     padding[2432];      /* multiple of 64 */

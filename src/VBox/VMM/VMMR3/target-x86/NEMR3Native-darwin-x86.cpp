@@ -4113,7 +4113,8 @@ VMMR3_INT_DECL(VBOXSTRICTRC) NEMR3RunGC(PVM pVM, PVMCPU pVCpu)
     if (   !pVCpu->nem.s.fUseDebugLoop
         && !nemR3DarwinAnyExpensiveProbesEnabled()
         && !DBGFIsStepping(pVCpu)
-        && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledSwBreakpoints)
+        && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledSwBreakpoints
+        && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cVmiBreakpoints)
         rcStrict = nemR3DarwinRunGuestNormal(pVM, pVCpu);
     else
         rcStrict = nemR3DarwinRunGuestDebug(pVM, pVCpu);

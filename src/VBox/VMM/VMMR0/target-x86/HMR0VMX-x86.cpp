@@ -7154,7 +7154,8 @@ VMMR0DECL(VBOXSTRICTRC) VMXR0RunGuestCode(PVMCPUCC pVCpu)
             if (   !pVCpu->hm.s.fUseDebugLoop
                 && (!VBOXVMM_ANY_PROBES_ENABLED() || !hmR0VmxAnyExpensiveProbesEnabled())
                 && !DBGFIsStepping(pVCpu)
-                && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledSwBreakpoints)
+                && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cEnabledSwBreakpoints
+                && !pVCpu->CTX_SUFF(pVM)->dbgf.ro.cVmiBreakpoints)
                 rcStrict = hmR0VmxRunGuestCodeNormal(pVCpu, &cLoops);
             else
                 rcStrict = hmR0VmxRunGuestCodeDebug(pVCpu, &cLoops);

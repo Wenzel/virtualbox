@@ -547,7 +547,7 @@ VMM_INT_DECL(int) DBGFTrap01Handler(PVM pVM, PVMCPU pVCpu, PCPUMCTX pCtx, RTGCUI
  * @param   pVCpu       The cross context virtual CPU structure.
  * @param   pCtx        Pointer to the register context for the CPU.
  */
-VMM_INT_DECL(VBOXSTRICTRC) DBGFTrap03Handler(PVMCC pVM, PVMCPUCC pVCpu, PCPUMCTX pCtx)
+static VBOXSTRICTRC dbgfTrap03Handler(PVMCC pVM, PVMCPUCC pVCpu, PCPUMCTX pCtx)
 {
 #if defined(IN_RING0)
     uint32_t volatile *paBpLocL1 = pVM->dbgfr0.s.CTX_SUFF(paBpLocL1);
@@ -615,5 +615,16 @@ VMM_INT_DECL(VBOXSTRICTRC) DBGFTrap03Handler(PVMCC pVM, PVMCPUCC pVCpu, PCPUMCTX
     }
 
     return VINF_EM_RAW_GUEST_TRAP;
+}
+
+VMM_INT_DECL(VBOXSTRICTRC) DBGFTrap03Handler(PVMCC pVM, PVMCPUCC pVCpu, PCPUMCTX pCtx)
+{
+    VBOXSTRICTRC rc = dbgfTrap03Handler(pVM, pVCpu, pCtx);
+    if (rc == VINF_EM_RAW_GUEST_TRAP && pVCpu->dbgf.s.fVmiBreakpoint)
+    {
+        pVCpu->dbgf.s.fVmiBpHit = true;
+        return VINF_EM_DBG_BREAKPOINT;
+    }
+    return rc;
 }
 

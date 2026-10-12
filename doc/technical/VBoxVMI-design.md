@@ -15,7 +15,7 @@ how the server is built and why. The wire protocol is in `VBoxVMI-protocol.md`.
   every VM unless that VM's config enables it, so building it by default costs
   nothing at runtime and avoids a special build configuration. The
   implementation is Linux only (`SOCK_SEQPACKET` with `SO_PEERCRED`).
-- `include/VBox/vmm/vmi.h` holds the wire structures and the two entry points.
+- `include/VBox/vmm/vmi.h` holds the wire structures and the entry points.
 
 ## Lifetime and configuration
 
@@ -53,11 +53,13 @@ how the server is built and why. The wire protocol is in `VBoxVMI-protocol.md`.
 ## Threading
 
 One server thread (`VMI`) owned by the module polls a wakeup pipe, the
-listening socket and the connected client. Termination writes to the pipe,
-shuts the client socket down (unblocking a send or receive) and waits for the
-thread, which disconnects the client. The wait is bounded (15 s); if the
-thread does not stop, it is abandoned with its instance data rather than
-hanging the VM teardown.
+listening socket and the connected client. EMTs append events to a
+mutex-protected ring (one outstanding event per vCPU) and wake that thread;
+only the server thread writes the socket, draining events in occurrence
+order. Termination sets a separate flag, writes to the same nonblocking
+pipe, shuts the client socket down (unblocking a send or receive) and waits
+for the thread. The wait is bounded (15 s); if it does not stop, its
+instance is abandoned rather than hanging VM teardown.
 
 - Every send to a client has a 5 s timeout (`SO_SNDTIMEO`): a client that
   stops reading its replies is dropped instead of blocking the server.
@@ -244,6 +246,46 @@ hanging the VM teardown.
 - RFLAGS is the architectural part only: CPUM keeps internal state (interrupt
   shadow, ...) in the upper bits, which reads hide and writes keep.
 
+## Breakpoints, steps and parked vCPUs
+
+The per-vCPU breakpoint intercept and single-step ownership flags live in
+the shared DBGFCPU, accessible from ring-0; the two VM-wide intercept counts
+share the read-only DBGF mirror used by HM and IEM. A vCPU's SET/CLEAR
+executes as an EMT request, serialized with the VirtualBox debugger's attach
+rendezvous. Attach refuses a nonzero VMI intercept count, while SET checks
+the debugger-attached flag before claiming an intercept. CLEAR is idempotent
+and works even while a debugger is attached. A breakpoint intercept count
+forces the HM debug loop and #BP exception exits (and the NEM/IEM equivalents)
+without changing DBGF's own breakpoint count.
+
+All engines funnel guest #BP through `DBGFTrap03Handler`. A DBGF breakpoint
+retains priority; a genuine guest #BP with a VMI intercept instead marks the
+vCPU as VMI-owned and returns the normal debug-breakpoint status. EM routes
+that status to `VMIR3DebugEvent`, not the unattached DBGF event sink. The EMT
+translates its flat PC to guest physical memory and disassembles the int3
+for its instruction length, then parks. On reply without reinjection, it
+reschedules with RIP unchanged. With reinjection, it asserts a TRPM software
+exception carrying the instruction length before rescheduling; HM then
+injects #BP with the return address past the instruction.
+
+On VT-x with monitor trap flag, setting single-step arms DBGF's raw
+single-instruction machinery for that vCPU. HM uses MTF rather than guest
+RFLAGS.TF and does not mask interrupts. EM routes VMI-owned stepped statuses
+to the same park. A #BP intercepted during stepping is reported first. AMD-V,
+NEM and VT-x without MTF are refused: their step path could modify guest
+debug state, which this protocol must not do. Clearing single-step stops
+arming it; an already-completed step reported after CLEAR is discarded
+instead of sent to an unattached debugger.
+
+The EMT's park loop processes its own and VM-wide requests and rendezvous,
+as DBGF does while waiting for a debugger command. The server sends queued
+events from its own thread. Replies execute as requests on the Parked EMT,
+so register read/write, SET/CLEAR, pause/resume and replying while paused
+cannot deadlock. A reply to an unparked vCPU or reinjection on a step
+changes nothing. A reset, power-off or destruction ends the park; a pause
+followed by resume does not. Disconnect clears every intercept and unblocks
+each Parked EMT without reinjection before the existing pause cleanup.
+
 ## Security
 
 - The socket file is 0600 from its creation: Linux creates it with the mode
@@ -266,15 +308,15 @@ hanging the VM teardown.
 A second connection is accepted only to be told `VERR_RESOURCE_BUSY` in the
 greeting and closed, so the client can report a clear error instead of hanging
 in the listen backlog. Two tools sharing a session would corrupt each other's
-state (pause ownership, later intercepts).
+state (pause ownership and intercepts).
 
 ## Disconnect
 
 `vmiR3Disconnect` ends every accepted client session, whether because of EOF,
 a socket or send-timeout error, a malformed request, failed handshake, normal
 close, or VM termination. It calls `vmiR3CleanupSession` exactly once before
-discarding the session state. That function is also the explicit cleanup point
-for future per-client intercept ownership.
+discarding the session state; that function removes intercepts, stops stepping,
+releases Parked vCPUs without reinjection, then handles pause ownership.
 
 If the session may still own its pause, cleanup calls `VMR3ResumeIf`
 synchronously. That function gathers every EMT in the same serialized
@@ -294,9 +336,9 @@ paused when the client disconnects.
 The predecessor (icebox's FDP) used shared memory. A socket gives connection
 lifetime for free (the server sees a crashed client as EOF and can clean up),
 access control by file mode and peer credentials, and one ordered channel for
-replies and later asynchronous events. Batched requests amortise the
-per-message cost; a shared-memory data path can be added over the socket later
-if profiling shows the need.
+replies and asynchronous events. Batched requests amortise the per-message
+cost; a shared-memory data path can be added over the socket later if
+profiling shows the need.
 
 ## Why SOCK_SEQPACKET
 

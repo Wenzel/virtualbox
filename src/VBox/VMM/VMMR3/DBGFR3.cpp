@@ -1193,6 +1193,12 @@ static DECLCALLBACK(VBOXSTRICTRC) dbgfR3Attach(PVM pVM, PVMCPU pVCpu, void *pvUs
         *prcAttach = VERR_DBGF_ALREADY_ATTACHED;
         return VINF_SUCCESS;
     }
+    if (pVM->dbgf.ro.cVmiIntercepts)
+    {
+        LogRel(("DBGF: Cannot attach the VirtualBox debugger while VBoxVMI intercepts are set\n"));
+        *prcAttach = VERR_DBGF_VMI_INTERCEPTS_ACTIVE;
+        return VINF_SUCCESS;
+    }
 
     /*
      * The per-CPU bits.
@@ -1203,6 +1209,7 @@ static DECLCALLBACK(VBOXSTRICTRC) dbgfR3Attach(PVM pVM, PVMCPU pVCpu, void *pvUs
 
         pUVCpu->dbgf.s.enmDbgfCmd = DBGFCMD_NO_COMMAND;
         RT_ZERO(pUVCpu->dbgf.s.DbgfCmdData);
+        pVM->apCpusR3[i]->dbgf.s.fVmiStepped = false;
     }
 
     /*
