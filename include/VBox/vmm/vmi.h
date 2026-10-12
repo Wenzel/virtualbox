@@ -89,6 +89,11 @@ RT_C_DECLS_BEGIN
 /** Write the registers of one vCPU.  Request body: VMIVCPUREQ followed by
  *  VMIX86REGS.  Reply body: empty. */
 #define VMI_MSG_REGS_WRITE          UINT16_C(0x0008)
+/** Write guest physical memory.  Request body: a uint32_t range count,
+ *  that many VMIPHYSRANGE entries, then the bytes of each range in order.
+ *  Reply body: an int32_t VBox status per guest page each range overlaps
+ *  (in request order). */
+#define VMI_MSG_PHYS_WRITE          UINT16_C(0x0009)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -130,7 +135,8 @@ typedef struct VMIHELLO
 AssertCompileSize(VMIHELLO, 8);
 
 /**
- * A guest physical memory range in a VMI_MSG_PHYS_READ request.
+ * A guest physical memory range in a VMI_MSG_PHYS_READ or
+ * VMI_MSG_PHYS_WRITE request.
  */
 typedef struct VMIPHYSRANGE
 {

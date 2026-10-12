@@ -61,9 +61,6 @@ hanging the VM teardown.
   listening socket for 1 s. Accept errors are logged at most 32 times.
 - System calls interrupted by signals (`EINTR`) are retried.
 
-A later command is planned as follows:
-
-- physical memory write: served on the server thread like reads (below).
 
 ## Physical memory reads
 
@@ -101,6 +98,33 @@ A later command is planned as follows:
   `net.core.wmem_max`. Revisit with measurements.
 - `VMI_MSG_RAM_RANGES` uses `PGMR3PhysGetRamBootZeroedRanges`, which lists the
   RAM ranges that are not ad hoc (ROM, MMIO, MMIO2) and merges contiguous ones.
+
+## Physical memory writes
+
+- `VMI_MSG_PHYS_WRITE` uses a leading 32-bit range count because descriptors
+  followed immediately by bytes otherwise have no unambiguous boundary. The
+  server validates every descriptor, checks for address wrap and requires the
+  exact concatenated data length before the first write. A malformed batch
+  changes nothing; valid batches report a status per overlapped 4 KiB page,
+  continue past failures, and may be partially applied.
+- Served on the server thread using `PGMR3PhysGCPhys2CCPtrExternal` for each
+  writable page, releasing its mapping immediately after copying. This API
+  replaces shared and zero pages, handles write-monitored pages, and refuses
+  MMIO and active handlers. Only RAM pages are eligible; MMIO, MMIO2
+  (including aliases), ROM and ROM shadows are refused. Allocation can
+  delegate to an EMT, during which the page may change type, be remapped or
+  gain a handler. The server holds the PGM lock while
+  checking the pinned page is still the page at that address, is writable,
+  and has no active handlers, through the copy. A delegated mapping cannot
+  bypass a newly installed handler or write to a stale mapping.
+- `PGMPhysWrite` on the EMT and `PGMR3PhysWriteExternal` off the EMT were
+  rejected despite their handler-aware write paths: both can call MMIO device
+  handlers, and `PGMR3PhysWriteExternal` silently skips unassigned physical
+  addresses. Writing directly through a read-only mapping or
+  `PGMPhysSimpleWriteGCPhys` would bypass access handlers and write-monitor
+  conversion. An active handler is thus a failed page, not a fallback write,
+  even when its backing is RAM. Pause the VM for consistent multi-page writes;
+  batch ordering alone is not a transaction.
 
 ## Pause and resume
 

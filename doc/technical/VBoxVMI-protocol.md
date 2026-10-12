@@ -55,6 +55,7 @@ connection.
 | `0x0006` | `VMI_MSG_VCPU_COUNT` | see vCPU count | 1 |
 | `0x0007` | `VMI_MSG_REGS_READ` | see Registers | 1 |
 | `0x0008` | `VMI_MSG_REGS_WRITE` | see Registers | 1 |
+| `0x0009` | `VMI_MSG_PHYS_WRITE` | see Physical memory write | 1 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -124,6 +125,46 @@ So one request reads at most 15 full pages (61440 bytes). A client splits
 bigger reads into several requests. The reads are served on the server thread,
 without waiting for a vCPU, and the VM keeps running unless it is paused: a
 range is not read atomically.
+
+## Physical memory write
+
+`VMI_MSG_PHYS_WRITE` writes guest physical memory in one request. Its body
+starts with a little-endian `uint32_t cRanges` (nonzero), followed by exactly
+`cRanges` `VMIPHYSRANGE` descriptors (same layout as Physical memory read),
+then the `cb` bytes for each range concatenated in descriptor order. The count
+distinguishes descriptors from data. The request, including its 16-byte header,
+must fit in 64 KiB.
+
+Reply body: one little-endian signed `int32_t` VBox status per 4 KiB guest page
+overlapped by each range, in range order, including repeated pages in
+overlapping ranges. A page succeeds with `VINF_SUCCESS` (0); otherwise its
+bytes are not written:
+
+- `VERR_PGM_PHYS_PAGE_RESERVED` (-1618): any non-RAM page (MMIO,
+  special aliased MMIO, MMIO2, ROM, or ROM shadow), or a RAM page with an
+  active access handler. No MMIO/device write handlers are called; access
+  handlers are not bypassed.
+- `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` (-1605): unmapped guest physical
+  address.
+- Another VirtualBox status: the writable page mapping could not be made.
+
+Only RAM pages without active access handlers can be written. Writable
+mappings perform VirtualBox's shared/zero-page conversion and write-monitor
+handling.
+If one page fails, the server continues with the remaining pages and the
+reply header `rc` is `VINF_SUCCESS`; this is not an atomic multi-page write.
+Ranges and pages may overlap, and later writes win. Like reads, writes are
+served on the server thread while the VM may be running; pause it when
+consistent guest state is required.
+
+Before writing any byte, the server validates every descriptor and the exact
+payload length. An invalid request has an empty reply body, keeps the
+connection, and returns:
+
+- `VERR_INVALID_PARAMETER` (-2): missing/zero count, insufficient
+  descriptors, zero-sized or wrapping range, nonzero reserved field, or
+  trailing/missing payload bytes;
+- `VERR_BUFFER_OVERFLOW` (-41): `16 + 4 * pages > 65536` for the reply.
 
 ## RAM ranges
 
@@ -284,5 +325,5 @@ client.
 
 ## Changes
 
-- Version 1: transport, header and handshake; physical memory read and RAM
-  ranges; pause, resume and vCPU count; registers.
+- Version 1: transport, header and handshake; physical memory read and write
+  and RAM ranges; pause, resume and vCPU count; registers.
