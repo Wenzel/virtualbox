@@ -10,6 +10,7 @@
     <p>When the VM starts, the socket is created as <filepath>vmi/<varname>VM-UUID</varname>.sock</filepath> in the <ph conkeyref="vbox-conkeyref-phrases/product-name"/> user home directory, for example <filepath>$HOME/.config/VirtualBox/vmi/</filepath>. To use another path, set it before starting the VM:</p>
     <pre xml:space="preserve">$ VBoxManage setextradata <varname>VM-name</varname> VBoxInternal/VMI/SocketPath /path/to/socket</pre>
     <p>The path must be absolute, and its directory must belong to the user running the VM and must not be writable by other users, unless it has the sticky bit set. A directory such as <filepath>/tmp</filepath> itself is therefore refused, but a private directory created in it is accepted.</p>
+    <p>A pause by the introspection tool is the same as <codeph>VBoxManage controlvm <varname>VM-name</varname> pause</codeph>: the VM is shown as paused and can be resumed either by the tool or as usual. A VM paused by the tool stays paused when the tool disconnects.</p>
     <p>The socket is accessible only by the user running the VM, and only one introspection tool can be connected to a VM at a time. If the socket cannot be created, the VM fails to start. To disable VBoxVMI again, remove the extra data item:</p>
     <pre xml:space="preserve">$ VBoxManage setextradata <varname>VM-name</varname> VBoxInternal/VMI/Enabled</pre>
   </body>
