@@ -25231,8 +25231,9 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
         with VBOX_E_VM_ERROR, carrying the VBox status code, if the register
         is read-only (VERR_DBGF_READ_ONLY_REGISTER), cannot be set
         (VERR_NOT_IMPLEMENTED) or refuses the value (e.g.
-        VERR_CPUM_RAISE_GP_0 for an invalid MSR value), and with
-        E_ACCESSDENIED if the VM is powered off.
+        VERR_INVALID_PARAMETER when RFLAGS bit 1 is clear or a reserved
+        read-as-zero bit is set, or VERR_CPUM_RAISE_GP_0 for an invalid MSR
+        value), and with E_ACCESSDENIED if the VM is powered off.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25245,8 +25246,9 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
           The new register value: an integer of up to 64 bits, hexadecimal
           (0x prefixed), octal (0 prefixed) or decimal, or for the descriptor
           table registers (gdtr, idtr) the base:limit format returned by the
-          getters.  Floating point and registers wider than 64 bits cannot
-          be set with this format.
+          getters.  An RFLAGS value must keep bit 1 set and all reserved
+          read-as-zero bits clear.  Floating point and registers wider than
+          64 bits cannot be set with this format.
         </desc>
       </param>
     </method>
