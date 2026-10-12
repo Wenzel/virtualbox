@@ -920,28 +920,82 @@ HRESULT MachineDebugger::modifyLogDestinations(const com::Utf8Str &aSettings)
     return hrc;
 }
 
+/**
+ * Worker for the read/write physical/virtual memory methods.
+ *
+ * Uses the debugger memory API, which does the access on the EMT of @a idCpu
+ * and bypasses MMIO and access handlers, so it never has device side effects.
+ * The access is split into chunks so the EMT is not held up by big requests.
+ *
+ * @returns COM status code.
+ * @param   idCpu       The virtual CPU the address is relative to.  Only
+ *                      matters for virtual addresses, pass 0 for physical.
+ * @param   fPhysical   Whether @a aAddress is a guest physical (true) or a
+ *                      guest virtual (false) address.
+ * @param   aAddress    The guest address.
+ * @param   cb          The number of bytes to read or write.
+ * @param   pvRead      The buffer to read into, NULL when writing.
+ * @param   pvWrite     The bytes to write, NULL when reading.
+ */
+HRESULT MachineDebugger::i_accessMemory(VMCPUID idCpu, bool fPhysical, LONG64 aAddress, size_t cb,
+                                        void *pvRead, const void *pvWrite)
+{
+    AutoWriteLock alock(this COMMA_LOCKVAL_SRC_POS);
+    Console::SafeVMPtr ptrVM(mParent);
+    HRESULT hrc = ptrVM.hrc();
+    if (SUCCEEDED(hrc))
+    {
+        PCVMMR3VTABLE const pVMM = ptrVM.vtable();
+        if (idCpu >= pVMM->pfnDBGFR3CpuGetCount(ptrVM.rawUVM()))
+            return setError(E_INVALIDARG, tr("Invalid CPU ID: %u"), idCpu);
+        for (size_t off = 0; off < cb; off += _64K)
+        {
+            size_t const cbChunk = RT_MIN(cb - off, _64K);
+            DBGFADDRESS  Addr;
+            if (fPhysical)
+                pVMM->pfnDBGFR3AddrFromPhys(ptrVM.rawUVM(), &Addr, (RTGCPHYS)aAddress + off);
+            else
+                pVMM->pfnDBGFR3AddrFromFlat(ptrVM.rawUVM(), &Addr, (RTGCUINTPTR)aAddress + off);
+
+            int vrc;
+            if (pvWrite)
+                vrc = pVMM->pfnDBGFR3MemWrite(ptrVM.rawUVM(), idCpu, &Addr, (uint8_t const *)pvWrite + off, cbChunk);
+            else
+                vrc = pVMM->pfnDBGFR3MemRead(ptrVM.rawUVM(), idCpu, &Addr, (uint8_t *)pvRead + off, cbChunk);
+            if (RT_FAILURE(vrc))
+                return setErrorBoth(VBOX_E_VM_ERROR, vrc,
+                                    pvWrite ? tr("Writing %zu bytes to guest %s address %#RX64 failed: %Rrc")
+                                            : tr("Reading %zu bytes from guest %s address %#RX64 failed: %Rrc"),
+                                    cbChunk, fPhysical ? "physical" : "virtual", aAddress + (LONG64)off, vrc);
+        }
+    }
+    return hrc;
+}
+
 HRESULT MachineDebugger::readPhysicalMemory(LONG64 aAddress, ULONG aSize, std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    aBytes.resize(aSize);
+    return i_accessMemory(0 /*idCpu*/, true /*fPhysical*/, aAddress, aSize, aBytes.data(), NULL);
 }
 
 HRESULT MachineDebugger::writePhysicalMemory(LONG64 aAddress, ULONG aSize, const std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    if (aBytes.size() != aSize)
+        return setError(E_INVALIDARG, tr("The size (%u) does not match the number of bytes given (%zu)"), aSize, aBytes.size());
+    return i_accessMemory(0 /*idCpu*/, true /*fPhysical*/, aAddress, aSize, NULL, aBytes.data());
 }
 
 HRESULT MachineDebugger::readVirtualMemory(ULONG aCpuId, LONG64 aAddress, ULONG aSize, std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aCpuId, aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    aBytes.resize(aSize);
+    return i_accessMemory(aCpuId, false /*fPhysical*/, aAddress, aSize, aBytes.data(), NULL);
 }
 
 HRESULT MachineDebugger::writeVirtualMemory(ULONG aCpuId, LONG64 aAddress, ULONG aSize, const std::vector<BYTE> &aBytes)
 {
-    RT_NOREF(aCpuId, aAddress, aSize, aBytes);
-    ReturnComNotImplemented();
+    if (aBytes.size() != aSize)
+        return setError(E_INVALIDARG, tr("The size (%u) does not match the number of bytes given (%zu)"), aSize, aBytes.size());
+    return i_accessMemory(aCpuId, false /*fPhysical*/, aAddress, aSize, NULL, aBytes.data());
 }
 
 HRESULT MachineDebugger::loadPlugIn(const com::Utf8Str &aName, com::Utf8Str &aPlugInName)
@@ -1193,15 +1247,99 @@ HRESULT MachineDebugger::getRegisters(ULONG aCpuId, std::vector<com::Utf8Str> &a
 
 HRESULT MachineDebugger::setRegister(ULONG aCpuId, const com::Utf8Str &aName, const com::Utf8Str &aValue)
 {
-    RT_NOREF(aCpuId, aName, aValue);
-    ReturnComNotImplemented();
+    try
+    {
+        return setRegisters(aCpuId, std::vector<com::Utf8Str>(1, aName), std::vector<com::Utf8Str>(1, aValue));
+    }
+    catch (std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+}
+
+/**
+ * Parses a register value for setRegister and setRegisters.
+ *
+ * @returns VBox status code, VERR_PARSE_ERROR if @a pszValue is not a valid value.
+ * @param   pszValue    An integer of up to 64 bits (0x prefixed hexadecimal, 0
+ *                      prefixed octal or decimal), or a descriptor table
+ *                      register value as formatted by getRegister (base:limit,
+ *                      the limit in hexadecimal).
+ * @param   pEntry      Where to return the value and its type.
+ */
+static int machineDebuggerParseRegValue(const char *pszValue, PDBGFREGENTRYNM pEntry)
+{
+    char *pszNext = NULL;
+    int vrc = RTStrToUInt64Ex(RTStrStripL(pszValue), &pszNext, 0, &pEntry->Val.u64);
+    if (vrc == VWRN_TRAILING_CHARS && *pszNext == ':')
+    {
+        pEntry->Val.dtr.u64Base = pEntry->Val.u64;
+        pEntry->enmType = DBGFREGVALTYPE_DTR;
+        vrc = RTStrToUInt32Full(pszNext + 1, 16, &pEntry->Val.dtr.u32Limit);
+    }
+    else
+        pEntry->enmType = DBGFREGVALTYPE_U64;
+    if (vrc == VINF_SUCCESS || vrc == VWRN_TRAILING_SPACES)
+        return VINF_SUCCESS;
+    return VERR_PARSE_ERROR;
 }
 
 HRESULT MachineDebugger::setRegisters(ULONG aCpuId, const std::vector<com::Utf8Str> &aNames,
                                       const std::vector<com::Utf8Str> &aValues)
 {
-    RT_NOREF(aCpuId, aNames, aValues);
-    ReturnComNotImplemented();
+    if (aNames.size() != aValues.size())
+        return setError(E_INVALIDARG, tr("The number of names (%zu) does not match the number of values (%zu)"),
+                        aNames.size(), aValues.size());
+
+    /*
+     * Parse all the values before writing anything.
+     */
+    std::vector<DBGFREGENTRYNM> aRegs;
+    try
+    {
+        aRegs.resize(aNames.size());
+    }
+    catch (std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+    for (size_t i = 0; i < aRegs.size(); i++)
+    {
+        aRegs[i].pszName = aNames[i].c_str();
+        int vrc = machineDebuggerParseRegValue(aValues[i].c_str(), &aRegs[i]);
+        if (RT_FAILURE(vrc))
+            return setErrorBoth(E_INVALIDARG, vrc, tr("Invalid value '%s' for register '%s'"),
+                                aValues[i].c_str(), aNames[i].c_str());
+    }
+
+    /*
+     * The prologue.
+     */
+    LogFlowThisFunc(("\n"));
+    AutoWriteLock alock(this COMMA_LOCKVAL_SRC_POS);
+    Console::SafeVMPtr ptrVM(mParent);
+    HRESULT hrc = ptrVM.hrc();
+    if (SUCCEEDED(hrc))
+    {
+        /*
+         * Real work.  One register at a time, so a failure can name the register.
+         * DBGF does each write on the EMT of the register's CPU.
+         */
+        for (size_t i = 0; i < aRegs.size() && SUCCEEDED(hrc); i++)
+        {
+            int vrc = ptrVM.vtable()->pfnDBGFR3RegNmSetBatch(ptrVM.rawUVM(), aCpuId, &aRegs[i], 1);
+            if (RT_SUCCESS(vrc))
+                continue;
+            if (vrc == VERR_DBGF_REGISTER_NOT_FOUND)
+                hrc = setErrorBoth(E_FAIL, vrc, tr("Register '%s' was not found"), aRegs[i].pszName);
+            else if (vrc == VERR_INVALID_CPU_ID)
+                hrc = setErrorBoth(E_FAIL, vrc, tr("Invalid CPU ID: %u"), aCpuId);
+            else
+                hrc = setErrorBoth(VBOX_E_VM_ERROR, vrc, tr("Setting register '%s' to '%s' failed: %Rrc"),
+                                   aRegs[i].pszName, aValues[i].c_str(), vrc);
+        }
+    }
+    return hrc;
 }
 
 HRESULT MachineDebugger::dumpGuestStack(ULONG aCpuId, com::Utf8Str &aStack)

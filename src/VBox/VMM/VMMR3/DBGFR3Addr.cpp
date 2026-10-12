@@ -372,23 +372,24 @@ static DECLCALLBACK(int) dbgfR3AddrToVolatileR3PtrOnVCpu(PUVM pUVM, VMCPUID idCp
      */
     int rc;
     PGMPAGEMAPLOCK Lock;
+    RTGCPHYS GCPhys = pAddress->FlatPtr;
     if (pAddress->fFlags & DBGFADDRESS_FLAGS_PHYS)
-    {
-        if (fReadOnly)
-            rc = PGMPhysGCPhys2CCPtrReadOnly(pVM, pAddress->FlatPtr, (void const **)ppvR3Ptr, &Lock);
-        else
-            rc = PGMPhysGCPhys2CCPtr(pVM, pAddress->FlatPtr, ppvR3Ptr, &Lock);
-    }
+        rc = VINF_SUCCESS;
     else
-    {
-        PVMCPU pVCpu = VMMGetCpuById(pVM, idCpu);
-        if (fReadOnly)
-            rc = PGMPhysGCPtr2CCPtrReadOnly(pVCpu, pAddress->FlatPtr, (void const **)ppvR3Ptr, &Lock);
-        else
-            rc = PGMPhysGCPtr2CCPtr(pVCpu, pAddress->FlatPtr, ppvR3Ptr, &Lock);
-    }
+        rc = PGMPhysGCPtr2GCPhys(VMMGetCpuById(pVM, idCpu), pAddress->FlatPtr, &GCPhys);
     if (RT_SUCCESS(rc))
-        PGMPhysReleasePageMappingLock(pVM, &Lock);
+    {
+        /* The read-only mapping refuses MMIO and special aliased MMIO pages (APIC access page),
+           which the writable one maps to the shared zero page, so always do it first. */
+        rc = PGMPhysGCPhys2CCPtrReadOnly(pVM, GCPhys, (void const **)ppvR3Ptr, &Lock);
+        if (RT_SUCCESS(rc) && !fReadOnly)
+        {
+            PGMPhysReleasePageMappingLock(pVM, &Lock);
+            rc = PGMPhysGCPhys2CCPtr(pVM, GCPhys, ppvR3Ptr, &Lock);
+        }
+        if (RT_SUCCESS(rc))
+            PGMPhysReleasePageMappingLock(pVM, &Lock);
+    }
     return rc;
 }
 

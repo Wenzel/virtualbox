@@ -116,6 +116,48 @@ static DECLCALLBACK(int) cpumR3RegSet_Generic(void *pvUser, PCDBGFREGDESC pDesc,
 
 /**
  * @interface_method_impl{DBGFREGDESC,pfnGet}
+ *
+ * Only the hardware bits, CPUM keeps internal state in the rest of RFLAGS.
+ */
+static DECLCALLBACK(int) cpumR3RegGet_rflags(void *pvUser, PCDBGFREGDESC pDesc, PDBGFREGVAL pValue)
+{
+    PVMCPU pVCpu = (PVMCPU)pvUser;
+    RT_NOREF(pDesc);
+
+    VMCPU_ASSERT_EMT(pVCpu);
+    Assert(pDesc->enmType == DBGFREGVALTYPE_U64);
+
+    pValue->u64 = pVCpu->cpum.s.Guest.rflags.uBoth & CPUMX86EFLAGS_HW_MASK_64;
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * @interface_method_impl{DBGFREGDESC,pfnSet}
+ *
+ * Only the hardware bits, CPUM keeps internal state in the rest of RFLAGS.
+ */
+static DECLCALLBACK(int) cpumR3RegSet_rflags(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue, PCDBGFREGVAL pfMask)
+{
+    PVMCPU         pVCpu     = (PVMCPU)pvUser;
+    uint64_t const fMask     = pfMask->u64 & CPUMX86EFLAGS_HW_MASK_64;
+    uint64_t const fNewValue = (pVCpu->cpum.s.Guest.rflags.uBoth & ~fMask) | (pValue->u64 & fMask);
+    RT_NOREF(pDesc);
+
+    VMCPU_ASSERT_EMT(pVCpu);
+    Assert(pDesc->enmType == DBGFREGVALTYPE_U64);
+
+    if (   (fNewValue & X86_EFL_RA1_MASK) != X86_EFL_RA1_MASK
+        || (fNewValue & X86_EFL_RAZ_MASK & CPUMX86EFLAGS_HW_MASK_64) != 0)
+        return VERR_INVALID_PARAMETER;
+
+    pVCpu->cpum.s.Guest.rflags.uBoth = fNewValue;
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * @interface_method_impl{DBGFREGDESC,pfnGet}
  */
 static DECLCALLBACK(int) cpumR3RegGet_XStateGeneric(void *pvUser, PCDBGFREGDESC pDesc, PDBGFREGVAL pValue)
 {
@@ -185,13 +227,72 @@ static DECLCALLBACK(int) cpumR3RegSet_XStateGeneric(void *pvUser, PCDBGFREGDESC 
 
 
 /**
- * @interface_method_impl{DBGFREGDESC,pfnGet}
+ * @interface_method_impl{DBGFREGDESC,pfnSet}
+ *
+ * Updates a selector register as raw debugger state.  The caller may update
+ * the selector, base and limit separately, so this deliberately does not do
+ * an architectural selector load from the descriptor table.
  */
 static DECLCALLBACK(int) cpumR3RegSet_seg(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue, PCDBGFREGVAL pfMask)
 {
-    /** @todo perform a selector load, updating hidden selectors and stuff. */
-    NOREF(pvUser); NOREF(pDesc); NOREF(pValue); NOREF(pfMask);
-    return VERR_NOT_IMPLEMENTED;
+    PVMCPU      pVCpu = (PVMCPU)pvUser;
+    PCPUMSELREG pSeg;
+    uint32_t    fChanged = CPUM_CHANGED_HIDDEN_SEL_REGS;
+
+    VMCPU_ASSERT_EMT(pVCpu);
+
+    switch (pDesc->enmReg)
+    {
+        case DBGFREG_CS:
+        case DBGFREG_CS_ATTR:
+        case DBGFREG_CS_BASE:
+        case DBGFREG_CS_LIMIT: pSeg = &pVCpu->cpum.s.Guest.cs; break;
+        case DBGFREG_DS:
+        case DBGFREG_DS_ATTR:
+        case DBGFREG_DS_BASE:
+        case DBGFREG_DS_LIMIT: pSeg = &pVCpu->cpum.s.Guest.ds; break;
+        case DBGFREG_ES:
+        case DBGFREG_ES_ATTR:
+        case DBGFREG_ES_BASE:
+        case DBGFREG_ES_LIMIT: pSeg = &pVCpu->cpum.s.Guest.es; break;
+        case DBGFREG_FS:
+        case DBGFREG_FS_ATTR:
+        case DBGFREG_FS_BASE:
+        case DBGFREG_FS_LIMIT: pSeg = &pVCpu->cpum.s.Guest.fs; break;
+        case DBGFREG_GS:
+        case DBGFREG_GS_ATTR:
+        case DBGFREG_GS_BASE:
+        case DBGFREG_GS_LIMIT: pSeg = &pVCpu->cpum.s.Guest.gs; break;
+        case DBGFREG_SS:
+        case DBGFREG_SS_ATTR:
+        case DBGFREG_SS_BASE:
+        case DBGFREG_SS_LIMIT: pSeg = &pVCpu->cpum.s.Guest.ss; break;
+        case DBGFREG_TR:
+        case DBGFREG_TR_ATTR:
+        case DBGFREG_TR_BASE:
+        case DBGFREG_TR_LIMIT:
+            pSeg = &pVCpu->cpum.s.Guest.tr;
+            fChanged |= CPUM_CHANGED_TR;
+            break;
+        case DBGFREG_LDTR:
+        case DBGFREG_LDTR_ATTR:
+        case DBGFREG_LDTR_BASE:
+        case DBGFREG_LDTR_LIMIT:
+            pSeg = &pVCpu->cpum.s.Guest.ldtr;
+            fChanged |= CPUM_CHANGED_LDTR;
+            break;
+        default:
+            AssertMsgFailedReturn(("%d %s\n", pDesc->enmReg, pDesc->pszName), VERR_IPE_NOT_REACHED_DEFAULT_CASE);
+    }
+
+    int rc = cpumR3RegSet_Generic(pvUser, pDesc, pValue, pfMask);
+    if (RT_SUCCESS(rc))
+    {
+        pSeg->ValidSel = pSeg->Sel;
+        pSeg->fFlags   = CPUMSELREG_FLAGS_VALID;
+        CPUMSetChangedFlags(pVCpu, fChanged);
+    }
+    return rc;
 }
 
 
@@ -217,17 +318,14 @@ static DECLCALLBACK(int) cpumR3RegGet_gdtr(void *pvUser, PCDBGFREGDESC pDesc, PD
  */
 static DECLCALLBACK(int) cpumR3RegSet_gdtr(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue, PCDBGFREGVAL pfMask)
 {
-    RT_NOREF(pfMask);
+    RT_NOREF(pDesc, pfMask);
 
-    PVMCPU    pVCpu = (PVMCPU)pvUser;
-    VBOXGDTR *pGdtr = (VBOXGDTR *)((uint8_t *)&pVCpu->cpum + pDesc->offRegister);
+    PVMCPU pVCpu = (PVMCPU)pvUser;
 
     VMCPU_ASSERT_EMT(pVCpu);
     Assert(pDesc->enmType == DBGFREGVALTYPE_DTR);
 
-    pGdtr->cbGdt = pValue->dtr.u32Limit;
-    pGdtr->pGdt  = pValue->dtr.u64Base;
-    return VINF_SUCCESS;
+    return CPUMSetGuestGDTR(pVCpu, pValue->dtr.u64Base, (uint16_t)pValue->dtr.u32Limit);
 }
 
 
@@ -253,17 +351,37 @@ static DECLCALLBACK(int) cpumR3RegGet_idtr(void *pvUser, PCDBGFREGDESC pDesc, PD
  */
 static DECLCALLBACK(int) cpumR3RegSet_idtr(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue, PCDBGFREGVAL pfMask)
 {
-    RT_NOREF(pfMask);
+    RT_NOREF(pDesc, pfMask);
 
-    PVMCPU    pVCpu = (PVMCPU)pvUser;
-    VBOXIDTR *pIdtr = (VBOXIDTR *)((uint8_t *)&pVCpu->cpum + pDesc->offRegister);
+    PVMCPU pVCpu = (PVMCPU)pvUser;
 
     VMCPU_ASSERT_EMT(pVCpu);
     Assert(pDesc->enmType == DBGFREGVALTYPE_DTR);
 
-    pIdtr->cbIdt = pValue->dtr.u32Limit;
-    pIdtr->pIdt = pValue->dtr.u64Base;
-    return VINF_SUCCESS;
+    return CPUMSetGuestIDTR(pVCpu, pValue->dtr.u64Base, (uint16_t)pValue->dtr.u32Limit);
+}
+
+
+/**
+ * @interface_method_impl{DBGFREGDESC,pfnSet}
+ */
+static DECLCALLBACK(int) cpumR3RegSet_dtrPart(void *pvUser, PCDBGFREGDESC pDesc, PCDBGFREGVAL pValue,
+                                             PCDBGFREGVAL pfMask)
+{
+    PVMCPU pVCpu = (PVMCPU)pvUser;
+
+    int rc = cpumR3RegSet_Generic(pvUser, pDesc, pValue, pfMask);
+    if (RT_SUCCESS(rc))
+    {
+        if (pDesc->enmReg == DBGFREG_GDTR_BASE || pDesc->enmReg == DBGFREG_GDTR_LIMIT)
+            rc = CPUMSetGuestGDTR(pVCpu, pVCpu->cpum.s.Guest.gdtr.pGdt, pVCpu->cpum.s.Guest.gdtr.cbGdt);
+        else
+        {
+            Assert(pDesc->enmReg == DBGFREG_IDTR_BASE || pDesc->enmReg == DBGFREG_IDTR_LIMIT);
+            rc = CPUMSetGuestIDTR(pVCpu, pVCpu->cpum.s.Guest.idtr.pIdt, pVCpu->cpum.s.Guest.idtr.cbIdt);
+        }
+    }
+    return rc;
 }
 
 
@@ -1152,10 +1270,10 @@ static DBGFREGSUBFIELD const g_aCpumRegFields_msr_ia32_spec_ctrl[] =
     CPU_REG_RW_AS(#LName,           UName,          U64, LName,                 cpumR3RegGet_Generic, cpumR3RegSet_Generic, g_aCpumRegAliases_##LName,  NULL)
 
 #define CPU_REG_SEG(UName, LName) \
-    CPU_REG_RW_AS(#LName,           UName,          U16, LName.Sel,             cpumR3RegGet_Generic, cpumR3RegSet_seg,     NULL,                       NULL                ), \
-    CPU_REG_RW_AS(#LName "_attr",   UName##_ATTR,   U32, LName.Attr.u,          cpumR3RegGet_Generic, cpumR3RegSet_Generic, NULL,                       g_aCpumRegFields_seg), \
-    CPU_REG_RW_AS(#LName "_base",   UName##_BASE,   U64, LName.u64Base,         cpumR3RegGet_Generic, cpumR3RegSet_Generic, NULL,                       NULL                ), \
-    CPU_REG_RW_AS(#LName "_lim",    UName##_LIMIT,  U32, LName.u32Limit,        cpumR3RegGet_Generic, cpumR3RegSet_Generic, NULL,                       NULL                )
+    CPU_REG_RW_AS(#LName,           UName,          U16, LName.Sel,             cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                ), \
+    CPU_REG_RW_AS(#LName "_attr",   UName##_ATTR,   U32, LName.Attr.u,          cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, g_aCpumRegFields_seg), \
+    CPU_REG_RW_AS(#LName "_base",   UName##_BASE,   U64, LName.u64Base,         cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                ), \
+    CPU_REG_RW_AS(#LName "_lim",    UName##_LIMIT,  U32, LName.u32Limit,        cpumR3RegGet_Generic, cpumR3RegSet_seg, NULL, NULL                )
 
 #define CPU_REG_MM(n) \
     CPU_REG_XS_RW_AS("mm" #n,       MM##n,          U64, x87.aRegs[n].mmx, cpumR3RegGet_XStateGeneric, cpumR3RegSet_XStateGeneric, NULL,                g_aCpumRegFields_mmN)
@@ -1210,7 +1328,7 @@ static DBGFREGDESC const g_aCpumRegGstDescs[] =
     CPU_REG_SEG(GS, gs),
     CPU_REG_SEG(SS, ss),
     CPU_REG_REG(RIP, rip),
-    CPU_REG_RW_AS("rflags",         RFLAGS,         U64, rflags,         cpumR3RegGet_Generic,         cpumR3RegSet_Generic,         g_aCpumRegAliases_rflags,   g_aCpumRegFields_rflags ),
+    CPU_REG_RW_AS("rflags",         RFLAGS,         U64, rflags,         cpumR3RegGet_rflags,          cpumR3RegSet_rflags,          g_aCpumRegAliases_rflags,   g_aCpumRegFields_rflags ),
     CPU_REG_XS_RW_AS("fcw",         FCW,            U16, x87.FCW,        cpumR3RegGet_XStateGeneric,   cpumR3RegSet_XStateGeneric,   NULL,                       g_aCpumRegFields_fcw    ),
     CPU_REG_XS_RW_AS("fsw",         FSW,            U16, x87.FSW,        cpumR3RegGet_XStateGeneric,   cpumR3RegSet_XStateGeneric,   NULL,                       g_aCpumRegFields_fsw    ),
     CPU_REG_XS_RO_AS("ftw",         FTW,            U16, x87,            cpumR3RegGet_ftw,             cpumR3RegSet_ftw,             NULL,                       g_aCpumRegFields_ftw    ),
@@ -1269,10 +1387,10 @@ static DBGFREGDESC const g_aCpumRegGstDescs[] =
     CPU_REG_YMM(13),
     CPU_REG_YMM(14),
     CPU_REG_YMM(15),
-    CPU_REG_RW_AS("gdtr_base",      GDTR_BASE,      U64, gdtr.pGdt,             cpumR3RegGet_Generic,   cpumR3RegSet_Generic,   NULL,                       NULL                    ),
-    CPU_REG_RW_AS("gdtr_lim",       GDTR_LIMIT,     U16, gdtr.cbGdt,            cpumR3RegGet_Generic,   cpumR3RegSet_Generic,   NULL,                       NULL                    ),
-    CPU_REG_RW_AS("idtr_base",      IDTR_BASE,      U64, idtr.pIdt,             cpumR3RegGet_Generic,   cpumR3RegSet_Generic,   NULL,                       NULL                    ),
-    CPU_REG_RW_AS("idtr_lim",       IDTR_LIMIT,     U16, idtr.cbIdt,            cpumR3RegGet_Generic,   cpumR3RegSet_Generic,   NULL,                       NULL                    ),
+    CPU_REG_RW_AS("gdtr_base",      GDTR_BASE,      U64, gdtr.pGdt,             cpumR3RegGet_Generic,   cpumR3RegSet_dtrPart,   NULL,                       NULL                    ),
+    CPU_REG_RW_AS("gdtr_lim",       GDTR_LIMIT,     U16, gdtr.cbGdt,            cpumR3RegGet_Generic,   cpumR3RegSet_dtrPart,   NULL,                       NULL                    ),
+    CPU_REG_RW_AS("idtr_base",      IDTR_BASE,      U64, idtr.pIdt,             cpumR3RegGet_Generic,   cpumR3RegSet_dtrPart,   NULL,                       NULL                    ),
+    CPU_REG_RW_AS("idtr_lim",       IDTR_LIMIT,     U16, idtr.cbIdt,            cpumR3RegGet_Generic,   cpumR3RegSet_dtrPart,   NULL,                       NULL                    ),
     CPU_REG_SEG(LDTR, ldtr),
     CPU_REG_SEG(TR, tr),
     CPU_REG_EX_AS("cr0",            CR0,            U32, 0,                     cpumR3RegGstGet_crX,    cpumR3RegGstSet_crX,    g_aCpumRegAliases_cr0,      g_aCpumRegFields_cr0    ),

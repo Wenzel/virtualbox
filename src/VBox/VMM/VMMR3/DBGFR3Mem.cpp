@@ -179,6 +179,13 @@ static DECLCALLBACK(int) dbgfR3MemRead(PUVM pUVM, VMCPUID idCpu, PCDBGFADDRESS p
                  || pAddress->FlatPtr + cbRead > _4G)
             &&  !PGMMODE_IS_64BIT_MODE(enmMode))
             return VERR_PAGE_TABLE_NOT_PRESENT;
+#ifdef VBOX_VMM_TARGET_X86
+        /* The page walk ignores bits 63:48, so a non-canonical address would alias a canonical one. */
+        if (    PGMMODE_IS_64BIT_MODE(enmMode)
+            &&  (   !X86_IS_CANONICAL(pAddress->FlatPtr)
+                 || !X86_IS_CANONICAL(pAddress->FlatPtr + cbRead - 1)))
+            return VERR_PAGE_TABLE_NOT_PRESENT;
+#endif
 
         rc = PGMPhysSimpleReadGCPtr(pVCpu, pvBuf, pAddress->FlatPtr, cbRead);
     }
@@ -329,6 +336,13 @@ static DECLCALLBACK(int) dbgfR3MemWrite(PUVM pUVM, VMCPUID idCpu, PCDBGFADDRESS 
                  || pAddress->FlatPtr + cbWrite > _4G)
             &&  !PGMMODE_IS_64BIT_MODE(enmMode))
             return VERR_PAGE_TABLE_NOT_PRESENT;
+#ifdef VBOX_VMM_TARGET_X86
+        /* The page walk ignores bits 63:48, so a non-canonical address would alias a canonical one. */
+        if (    PGMMODE_IS_64BIT_MODE(enmMode)
+            &&  (   !X86_IS_CANONICAL(pAddress->FlatPtr)
+                 || !X86_IS_CANONICAL(pAddress->FlatPtr + cbWrite - 1)))
+            return VERR_PAGE_TABLE_NOT_PRESENT;
+#endif
 
         rc = PGMPhysSimpleWriteGCPtr(pVCpu, pAddress->FlatPtr, pvBuf, cbWrite);
     }

@@ -142,6 +142,7 @@
       </li>
     </ul>
     <p>The output of the <userinput>info</userinput> commands generally requires in-depth knowledge of the emulated device or <ph conkeyref="vbox-conkeyref-phrases/product-name"/> VMM internals. However, when used properly, the information provided can be very valuable.</p>
+    <p>Tools that inspect a running VM, such as memory forensics or virtual machine introspection tools, can use the <codeph>IMachineDebugger</codeph> interface of the <ph conkeyref="vbox-conkeyref-phrases/product-name"/> API instead of the debugger console. It does not require the debugger to be enabled. Its <codeph>readPhysicalMemory</codeph>, <codeph>writePhysicalMemory</codeph>, <codeph>readVirtualMemory</codeph>, and <codeph>writeVirtualMemory</codeph> methods read and write guest memory without involving emulated devices. Its <codeph>getRegister</codeph>, <codeph>getRegisters</codeph>, <codeph>setRegister</codeph>, and <codeph>setRegisters</codeph> methods read and write guest CPU registers. Any API client that can access the VM can use these methods, like <userinput>VBoxManage debugvm</userinput>. See the <ph conkeyref="vbox-conkeyref-phrases/product-name"/> SDK reference for details.</p>
   </body>
   
 </topic>

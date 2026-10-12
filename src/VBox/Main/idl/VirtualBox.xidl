@@ -24998,8 +24998,20 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       <desc>
         Reads guest physical memory, no side effects (MMIO++).
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
+        read, ballooned RAM reads as zeros.  Access handlers are bypassed, so
+        the read never reaches a device.
+
+        The access is done in chunks of 64 KB, each one performed by the
+        virtual CPU on its own thread, so on a running VM every chunk waits
+        until the virtual CPU is available and a big access is not a
+        consistent snapshot; pause the VM for that.  The size is only limited
+        by its 32-bit type, but the whole buffer is transferred in one call.
+
+        Fails with VBOX_E_VM_ERROR, carrying the VBox status code, at the
+        first page that is MMIO (VERR_PGM_PHYS_PAGE_RESERVED) or not assigned
+        (VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS), and with E_ACCESSDENIED if the
+        VM is powered off.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
@@ -25014,16 +25026,28 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="writePhysicalMemory">
       <desc>
-        Writes guest physical memory, access handles (MMIO++) are ignored.
+        Writes guest physical memory, access handlers (MMIO++) are ignored.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        RAM, ROM and device memory backed by host memory (e.g. VRAM) can be
+        written.  Access handlers are bypassed, so the write never reaches a
+        device.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a size does not match the number of bytes
+        given, with VBOX_E_VM_ERROR, carrying the VBox status code, at the
+        first page that is MMIO (VERR_PGM_PHYS_PAGE_RESERVED), ballooned
+        (VERR_PGM_PHYS_PAGE_BALLOONED) or not assigned
+        (VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS), and with E_ACCESSDENIED if the
+        VM is powered off.  The write is not atomic: the pages before the
+        failing one may already have been modified.
       </desc>
       <param name="address" type="long long" dir="in">
         <desc>The guest physical address.</desc>
       </param>
       <param name="size" type="unsigned long" dir="in">
-        <desc>The number of bytes to read.</desc>
+        <desc>The number of bytes to write.</desc>
       </param>
       <param name="bytes" type="octet" safearray="yes" dir="in">
         <desc>The bytes to write.</desc>
@@ -25034,8 +25058,23 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       <desc>
         Reads guest virtual memory, no side effects (MMIO++).
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The address is translated with the current paging mode and page
+        tables (CR3) of the given virtual CPU, without setting accessed bits.
+        It is a linear address: no segment base is added.  With paging
+        disabled it is used as the guest physical address.  Outside long mode,
+        addresses at or above 4 GB fail, and in long mode non-canonical
+        addresses fail; both with VERR_PAGE_TABLE_NOT_PRESENT.  The guest
+        physical memory it maps is read like <link to="#readPhysicalMemory"/>
+        does.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a cpuId is not a valid virtual CPU, with
+        VBOX_E_VM_ERROR, carrying the VBox status code, at the first page that
+        is not mapped (e.g. VERR_PAGE_NOT_PRESENT,
+        VERR_PAGE_TABLE_NOT_PRESENT) or maps MMIO or unassigned memory, and
+        with E_ACCESSDENIED if the VM is powered off.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25053,10 +25092,24 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="writeVirtualMemory">
       <desc>
-        Writes guest virtual memory, access handles (MMIO++) are ignored.
+        Writes guest virtual memory, access handlers (MMIO++) are ignored.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The address is translated like <link to="#readVirtualMemory"/> does,
+        without setting accessed or dirty bits and ignoring write protection.
+        The guest physical memory it maps is written like
+        <link to="#writePhysicalMemory"/> does.
+
+        Chunking, consistency and size limit as for
+        <link to="#readPhysicalMemory"/>.
+
+        Fails with E_INVALIDARG if @a cpuId is not a valid virtual CPU or
+        @a size does not match the number of bytes given, with
+        VBOX_E_VM_ERROR, carrying the VBox status code, at the first page that
+        is not mapped (e.g. VERR_PAGE_NOT_PRESENT,
+        VERR_PAGE_TABLE_NOT_PRESENT) or maps memory that
+        <link to="#writePhysicalMemory"/> refuses, and with E_ACCESSDENIED if
+        the VM is powered off.  The write is not atomic: the pages before the
+        failing one may already have been modified.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25065,7 +25118,7 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
         <desc>The guest virtual address.</desc>
       </param>
       <param name="size" type="unsigned long" dir="in">
-        <desc>The number of bytes to read.</desc>
+        <desc>The number of bytes to write.</desc>
       </param>
       <param name="bytes" type="octet" safearray="yes" dir="in">
         <desc>The bytes to write.</desc>
@@ -25140,6 +25193,12 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
     <method name="getRegisters">
       <desc>
         Gets all the registers for the given CPU.
+
+        Currently @a cpuId is ignored: the registers of all virtual CPUs are
+        returned, their names prefixed with the CPU set (cpu0., cpu1., ...),
+        followed by the device registers.  The virtual CPUs are queried
+        together in one rendezvous, so their registers are consistent with
+        each other.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25157,10 +25216,24 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
 
     <method name="setRegister">
       <desc>
-        Gets one register.
+        Sets one register.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        The register is written by the virtual CPU on its own thread, so on
+        a running VM the write waits until the virtual CPU is available and
+        takes effect when the guest resumes execution there.  Segment
+        selectors and their hidden base, limit and attribute fields are raw
+        debugger state: changing a selector does not load a descriptor, so
+        callers that need a complete segment update must set the hidden fields
+        too.  A value wider than the register is truncated.
+
+        Fails with E_INVALIDARG if the value cannot be parsed, with E_FAIL if
+        @a cpuId is not a valid virtual CPU or the register was not found,
+        with VBOX_E_VM_ERROR, carrying the VBox status code, if the register
+        is read-only (VERR_DBGF_READ_ONLY_REGISTER), cannot be set
+        (VERR_NOT_IMPLEMENTED) or refuses the value (e.g.
+        VERR_INVALID_PARAMETER when RFLAGS bit 1 is clear or a reserved
+        read-as-zero bit is set, or VERR_CPUM_RAISE_GP_0 for an invalid MSR
+        value), and with E_ACCESSDENIED if the VM is powered off.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
@@ -25170,19 +25243,28 @@ Snapshot 1 (B.vdi)            Snapshot 1 (B.vdi)
       </param>
       <param name="value" type="wstring" dir="in">
         <desc>
-          The new register value. Hexadecimal, decimal and octal formats
-          are supported in addition to any special formats returned by
-          the getters.
+          The new register value: an integer of up to 64 bits, hexadecimal
+          (0x prefixed), octal (0 prefixed) or decimal, or for the descriptor
+          table registers (gdtr, idtr) the base:limit format returned by the
+          getters.  An RFLAGS value must keep bit 1 set and all reserved
+          read-as-zero bits clear.  Floating point and registers wider than
+          64 bits cannot be set with this format.
         </desc>
       </param>
     </method>
 
     <method name="setRegisters">
       <desc>
-        Sets zero or more registers atomically.
+        Sets zero or more registers.
 
-        This feature is not implemented in the 4.0.0 release but may show up
-        in a dot release.
+        All the values are parsed before any register is written.  The
+        registers are then written in order, each one like
+        <link to="#setRegister"/> does, stopping at the first failure, which
+        is reported like for <link to="#setRegister"/>: the registers before
+        the failing one stay written.  On a running VM the registers are not
+        written all at once; pause the VM for a consistent update.
+
+        Fails with E_INVALIDARG if the arrays differ in size.
       </desc>
       <param name="cpuId" type="unsigned long" dir="in">
         <desc>The identifier of the Virtual CPU.</desc>
