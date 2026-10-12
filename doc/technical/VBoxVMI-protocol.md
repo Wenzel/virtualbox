@@ -253,8 +253,9 @@ Writes:
   15, 22 to 63); CR0, CR4 or EFER with a reserved bit set (for the guest CPU),
   CR0.PG without CR0.PE, CR0.NW without CR0.CD; EFER.LMA other than CR0.PG and
   EFER.LME, long mode without CR4.PAE, CR4.PCIDE outside long mode; CR3 with a
-  bit set above the guest's physical address width; PAE page-directory-pointer
-  entries with reserved bits set; an MSR value that `WRMSR` refuses. CR0,
+  bit set above the guest's physical address width; with PAE paging,
+  page-directory-pointer entries at CR3 that are not in guest RAM or have
+  reserved bits set; an MSR value that `WRMSR` refuses. CR0,
   CR3, CR4 and EFER are checked together, not in an instruction order. Paging
   changes take effect as after `MOV` to CR0/CR3/CR4 (TLB flushed, paging mode
   switched).

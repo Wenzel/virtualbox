@@ -717,11 +717,13 @@ static bool vmiR3RegsAreReservedZero(VMIX86REGS const *pRegs)
  * Checks the values of a VMI_MSG_REGS_WRITE request that the CPU itself would
  * refuse to load (\#GP on POPF, MOV to CRx or WRMSR), checking the control
  * registers and EFER as a whole.  Values equal to the current ones are always
- * accepted, so that registers read earlier can be written back.  The MSRs are
- * checked by CPUMSetGuestMsr when written.
+ * accepted, so that registers read earlier can be written back.  No side
+ * effects: this runs before anything is written.  The MSRs are checked by
+ * CPUMSetGuestMsr when written.
  */
-static bool vmiR3RegsAreValid(PVM pVM, PCCPUMCTX pCtx, VMIX86REGS const *pNew)
+static bool vmiR3RegsAreValid(PVMCPU pVCpu, PCCPUMCTX pCtx, VMIX86REGS const *pNew)
 {
+    PVM const pVM = pVCpu->CTX_SUFF(pVM);
     if (   pNew->rflags != (pCtx->rflags.uBoth & CPUMX86EFLAGS_HW_MASK_64)
         && (   !(pNew->rflags & X86_EFL_RA1_MASK)
             || (pNew->rflags & ~(uint64_t)(X86_EFL_LIVE_MASK | X86_EFL_RA1_MASK))))
@@ -731,23 +733,37 @@ static bool vmiR3RegsAreValid(PVM pVM, PCCPUMCTX pCtx, VMIX86REGS const *pNew)
         && (pNew->cr3 & (UINT64_MAX << pVM->cpum.ro.GuestFeatures.cMaxPhysAddrWidth)))
         return false;
 
-    if (   pNew->cr0     == pCtx->cr0
-        && pNew->cr4     == pCtx->cr4
-        && pNew->msrEFER == pCtx->msrEFER)
-        return true;
     uint64_t const uCr0  = pNew->cr0;
     uint64_t const uCr4  = pNew->cr4;
     uint64_t const uEfer = pNew->msrEFER;
-    bool const     fLma  = RT_BOOL(uEfer & MSR_K6_EFER_LMA);
-    return !(uCr0 & ~CPUMGetGuestCR0ValidMask())
-        && (!(uCr0 & X86_CR0_PG) || (uCr0 & X86_CR0_PE))
-        && (!(uCr0 & X86_CR0_NW) || (uCr0 & X86_CR0_CD))
-        && !(uCr4 & ~CPUMGetGuestCR4ValidMask(pVM))
-        && !(uEfer & ~CPUMGetGuestEferMsrValidMask(pVM))
-        /* EFER.LMA is CR0.PG and EFER.LME, long mode needs PAE, and PCIDE long mode. */
-        && fLma == ((uCr0 & X86_CR0_PG) && (uEfer & MSR_K6_EFER_LME))
-        && (!fLma || (uCr4 & X86_CR4_PAE))
-        && (!(uCr4 & X86_CR4_PCIDE) || fLma);
+    bool const fModeChanged = uCr0 != pCtx->cr0 || uCr4 != pCtx->cr4 || uEfer != pCtx->msrEFER;
+    if (fModeChanged)
+    {
+        bool const fLma = RT_BOOL(uEfer & MSR_K6_EFER_LMA);
+        if (   (uCr0 & ~CPUMGetGuestCR0ValidMask())
+            || ((uCr0 & X86_CR0_PG) && !(uCr0 & X86_CR0_PE))
+            || ((uCr0 & X86_CR0_NW) && !(uCr0 & X86_CR0_CD))
+            || (uCr4 & ~CPUMGetGuestCR4ValidMask(pVM))
+            || (uEfer & ~CPUMGetGuestEferMsrValidMask(pVM))
+            /* EFER.LMA is CR0.PG and EFER.LME, long mode needs PAE, and PCIDE long mode. */
+            || fLma != ((uCr0 & X86_CR0_PG) && (uEfer & MSR_K6_EFER_LME))
+            || (fLma && !(uCr4 & X86_CR4_PAE))
+            || ((uCr4 & X86_CR4_PCIDE) && !fLma))
+            return false;
+    }
+
+    /* PAE paging loads the PDPTEs at CR3 (MOV to CR0, CR3, CR4): they must be in
+       memory and have no reserved bits set.  Mapping them changes CPUM and PGM
+       state, so they are only read and checked here. */
+    if (   (fModeChanged || pNew->cr3 != pCtx->cr3)
+        && CPUMIsPaePagingEnabled(uCr0, uCr4, uEfer))
+    {
+        X86PDPE aPdpes[X86_PG_PAE_PDPE_ENTRIES];
+        int rc = PGMPhysSimpleReadGCPhys(pVM, aPdpes, pNew->cr3 & X86_CR3_PAE_PAGE_MASK, sizeof(aPdpes));
+        if (RT_FAILURE(rc) || !PGMGstArePaePdpesValid(pVCpu, aPdpes))
+            return false;
+    }
+    return true;
 }
 
 
@@ -842,13 +858,14 @@ static DECLCALLBACK(int) vmiR3RegsWriteOnEmt(PVM pVM, VMIX86REGS const *pNew)
         return VERR_VM_INVALID_VM_STATE; /* Saving, teleporting, powering off, ...: the state may be gone already. */
     CPUM_IMPORT_EXTRN_RET(pVCpu, CPUMCTX_EXTRN_ALL);
     PCPUMCTX const pCtx = &pVCpu->cpum.GstCtx;
-    if (!vmiR3RegsAreValid(pVM, pCtx, pNew))
+    if (!vmiR3RegsAreValid(pVCpu, pCtx, pNew))
         return VERR_INVALID_PARAMETER;
 
     /*
      * What may still fail comes first and is undone on failure: the MSRs, which
-     * WRMSR checks, and mapping the paging structures at the new CR3, before the
-     * mode change, like MOV to CRx.
+     * only WRMSR checks, the APIC base last as it may not be undoable, then
+     * mapping the paging structures at the new CR3, before the mode change, like
+     * MOV to CRx, which was checked above already.
      */
     uint64_t auOld[RT_ELEMENTS(g_aidVmiMsrs)];
     uint64_t auNew[RT_ELEMENTS(g_aidVmiMsrs)];
@@ -864,7 +881,7 @@ static DECLCALLBACK(int) vmiR3RegsWriteOnEmt(PVM pVM, VMIX86REGS const *pNew)
     if (RT_SUCCESS(rc) && fPagingChanged && CPUMIsPaePagingEnabled(pNew->cr0, pNew->cr4, pNew->msrEFER))
     {
         rc = PGMGstMapPaePdpesAtCr3(pVCpu, pNew->cr3);
-        if (rc == VERR_PGM_PAE_PDPE_RSVD) /* MOV to CRx raises #GP */
+        if (RT_FAILURE(rc)) /* MOV to CRx raises #GP(0); checked above, so unlikely. */
             rc = VERR_INVALID_PARAMETER;
     }
     if (RT_SUCCESS(rc) && fPagingChanged)

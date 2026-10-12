@@ -186,12 +186,17 @@ A later command is planned as follows:
   ring-3 and re-enter the guest with the old VMCS state. NEM exports every
   part of the context that is not marked external.
 - Writes follow the guest CPU rather than DBGF's raw stores: a changed value
-  the CPU would refuse (`POPF`, `MOV` to CRx, `WRMSR`) is refused, all values
-  are checked before anything is written, and the MSRs, which only
-  `CPUMSetGuestMsr` can check, are written first and written back if anything
-  later fails. The APIC base is the last MSR, as the only one whose old value
-  may not be writable back. Unchanged registers are not touched, so writing
-  back registers read earlier always succeeds and reprograms nothing.
+  the CPU would refuse (`POPF`, `MOV` to CRx, `WRMSR`) is refused, and every
+  check without side effects runs before anything is written, including the
+  PAE PDPTEs at the new CR3 (read with `PGMPhysSimpleReadGCPhys`, checked with
+  `PGMGstArePaePdpesValid`), since mapping them changes CPUM and PGM state.
+  Then the MSRs, which only `CPUMSetGuestMsr` can check, are written and
+  written back if anything later fails. The APIC base is the last MSR and the
+  last write that can be refused: its old value may not be writable back
+  (x2APIC to xAPIC), and disabling the APIC resets it. After it only mapping
+  the PDPTEs (checked already) can fail. Unchanged registers are not touched,
+  so writing back registers read earlier always succeeds and reprograms
+  nothing.
 - CR0, CR3, CR4 and EFER are checked as one state (EFER.LMA against CR0.PG and
   EFER.LME, PAE for long mode), since the client writes them together and no
   instruction order applies. A paging change is propagated like `MOV` to CRx
