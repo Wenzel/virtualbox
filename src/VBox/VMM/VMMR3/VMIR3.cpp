@@ -109,6 +109,10 @@ typedef struct VMIR3
     int             afdWakeup[2];
     /** Set when the client completed the handshake. */
     bool            fHandshaked;
+    /** Set while the VM is suspended because the client asked for it: a
+     *  VMI_MSG_PAUSE suspended it (not one that found it suspended already).
+     *  Cleared by the client's VMI_MSG_RESUME and when the session ends. */
+    bool            fPausedByClient;
     /** RTTimeMilliTS until which accepting is suspended (out of descriptors). */
     uint64_t        msAcceptResume;
     /** The socket path (heap). */
@@ -188,16 +192,18 @@ static int vmiR3SendHello(int fd, uint32_t idReq, uint16_t fFlags, int32_t rcMsg
  * Drops the connected client.
  *
  * This is where a client session ends, whatever the reason, so this is where
- * the server will undo what the client did to the VM (resume, intercepts).
+ * the server will undo what the client did to the VM (resume if
+ * fPausedByClient, intercepts).  For now the VM stays as the client left it.
  */
 static void vmiR3Disconnect(PVMIR3 pThis)
 {
-    LogRel(("VMI: Client disconnected\n"));
+    LogRel(("VMI: Client disconnected%s\n", pThis->fPausedByClient ? ", leaving the VM paused" : ""));
     RTSemFastMutexRequest(pThis->hMtxClient);
     close(pThis->fdClient);
     pThis->fdClient = -1;
     RTSemFastMutexRelease(pThis->hMtxClient);
-    pThis->fHandshaked = false;
+    pThis->fHandshaked     = false;
+    pThis->fPausedByClient = false;
 }
 
 
@@ -447,6 +453,72 @@ static bool vmiR3HandleRamRanges(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
 
 
 /**
+ * Handles VMI_MSG_PAUSE and VMI_MSG_RESUME requests.
+ *
+ * VirtualBox's standard suspend and resume, as IConsole::Pause and
+ * IConsole::Resume do it, so Main reports the VM as paused or running by the
+ * time the reply is sent.  Synchronous: VMR3Suspend returns once every EMT has
+ * stopped executing guest code.  Idempotent: pausing a suspended VM and
+ * resuming a running one succeed and do nothing, so one resume undoes any
+ * number of pauses, whoever made them.
+ *
+ * Runs on the server thread, which waits for the EMT rendezvous.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandlePauseResume(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    PUVM          pUVM    = pThis->pUVM;
+    bool const    fPause  = pHdr->uType == VMI_MSG_PAUSE;
+    VMSTATE const enmFrom = fPause ? VMSTATE_RUNNING   : VMSTATE_SUSPENDED;
+    VMSTATE const enmTo   = fPause ? VMSTATE_SUSPENDED : VMSTATE_RUNNING;
+
+    int rc = cbBody ? VERR_INVALID_PARAMETER : VINF_SUCCESS;
+    if (RT_SUCCESS(rc))
+    {
+        VMSTATE const enmState = VMR3GetStateU(pUVM);
+        if (enmState == enmTo)
+            rc = VINF_SUCCESS;
+        else if (enmState != enmFrom)
+            rc = VERR_VM_INVALID_VM_STATE; /* Powering on or off, saving, live snapshot, teleporting, ... */
+        else if (!fPause && VMR3GetSuspendReason(pUVM) == VMSUSPENDREASON_HOST_SUSPEND)
+            rc = VERR_VM_INVALID_VM_STATE; /* Like IConsole::Resume: the host resume does it. */
+        else
+        {
+            rc = fPause ? VMR3Suspend(pUVM, VMSUSPENDREASON_USER) : VMR3Resume(pUVM, VMRESUMEREASON_USER);
+            if (RT_SUCCESS(rc))
+            {
+                rc = VINF_SUCCESS; /* Not the EM scheduling status. */
+                pThis->fPausedByClient = fPause;
+            }
+            else if (VMR3GetStateU(pUVM) == enmTo)
+                rc = VINF_SUCCESS; /* Someone else paused or resumed it meanwhile. */
+            Log(("VMI: %s the VM for the client: %Rrc\n", fPause ? "Suspending" : "Resuming", rc));
+        }
+        if (RT_SUCCESS(rc) && !fPause)
+            pThis->fPausedByClient = false;
+    }
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
+}
+
+
+/**
+ * Handles a VMI_MSG_VCPU_COUNT request.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandleVCpuCount(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    if (cbBody)
+        return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VERR_INVALID_PARAMETER,
+                                    NULL, 0));
+    uint32_t const cCpus = pThis->pUVM->cCpus;
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VINF_SUCCESS,
+                                &cCpus, sizeof(cCpus)));
+}
+
+
+/**
  * Receives and handles one message from the client.
  *
  * @returns false if the client must be disconnected.
@@ -492,6 +564,11 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
             return vmiR3HandlePhysRead(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_RAM_RANGES:
             return vmiR3HandleRamRanges(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_PAUSE:
+        case VMI_MSG_RESUME:
+            return vmiR3HandlePauseResume(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_VCPU_COUNT:
+            return vmiR3HandleVCpuCount(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         default:
             break;
     }

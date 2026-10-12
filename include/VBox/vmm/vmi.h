@@ -73,6 +73,16 @@ RT_C_DECLS_BEGIN
 /** Get the guest RAM ranges.  Request body: empty.
  *  Reply body: an array of VMIRAMRANGE sorted by address. */
 #define VMI_MSG_RAM_RANGES          UINT16_C(0x0003)
+/** Pause the VM (standard suspend, the VM shows as paused), a no-op if it is
+ *  suspended already.  The reply is sent once every vCPU has stopped.
+ *  Request and reply body: empty. */
+#define VMI_MSG_PAUSE               UINT16_C(0x0004)
+/** Resume the VM, a no-op if it is running already, whoever paused it.
+ *  Request and reply body: empty. */
+#define VMI_MSG_RESUME              UINT16_C(0x0005)
+/** Get the number of vCPUs.  Request body: empty.
+ *  Reply body: a uint32_t, the vCPU count. */
+#define VMI_MSG_VCPU_COUNT          UINT16_C(0x0006)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
