@@ -276,14 +276,18 @@ close, or VM termination. It calls `vmiR3CleanupSession` exactly once before
 discarding the session state. That function is also the explicit cleanup point
 for future per-client intercept ownership.
 
-If the session's pause is still its own according to the resume generation,
-cleanup checks the same run-state restrictions as an explicit resume and calls
-`VMR3Resume` synchronously. It drops pause ownership only after that call has
-returned with the VM in `Running`, or after logging why it could not resume
-during a concurrent power-off or destruction. A pause that merely found the VM
-paused is not owned. A resume by any actor ends ownership, so an external
-resume followed by an external pause is left paused when the client
-disconnects.
+If the session may still own its pause, cleanup calls `VMR3ResumeIf`
+synchronously. That function gathers every EMT in the same serialized
+rendezvous used by `VMR3Resume`; on the first EMT, immediately before changing
+`Suspended` to `Resuming`, the VBoxVMI predicate verifies the active ownership
+flag, captured and current resume generations, `Suspended` state, `USER`
+suspend reason, and teleport restriction. No external resume/pause rendezvous
+can interleave between that check and the transition. If ownership changed,
+the conditional resume is cancelled; otherwise it returns only after the VM
+reaches `Running`. Cleanup then drops ownership, logging any transition error.
+A pause that merely found the VM paused is not owned. A resume by any actor
+ends ownership, so an external resume followed by an external pause is left
+paused when the client disconnects.
 
 ## Why a Unix socket and not shared memory
 

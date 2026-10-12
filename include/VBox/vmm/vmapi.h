@@ -177,6 +177,21 @@ typedef DECLCALLBACKTYPE(void, FNVMATSTATE,(PUVM pUVM, PCVMMR3VTABLE pVMM, VMSTA
 /** Pointer to a VM state callback. */
 typedef FNVMATSTATE *PFNVMATSTATE;
 
+/**
+ * Checks whether a pending conditional resume still owns the suspension.
+ *
+ * Called on the first EMT in the resume rendezvous, immediately before the VM
+ * state changes from Suspended to Resuming.  The callback must not change VM
+ * state or block.
+ *
+ * @returns VINF_SUCCESS to resume, a failure status to cancel it.
+ * @param   pUVM        The user mode VM handle.
+ * @param   pvUser      The user argument.
+ */
+typedef DECLCALLBACKTYPE(int, FNVMRESUMECHECK,(PUVM pUVM, void *pvUser));
+/** Pointer to a conditional resume check. */
+typedef FNVMRESUMECHECK *PFNVMRESUMECHECK;
+
 VMMDECL(const char *)   VMGetStateName(VMSTATE enmState);
 
 VMMDECL(uint32_t)       VMGetResetCount(PVMCC pVM);
@@ -396,6 +411,8 @@ VMMR3DECL(int)          VMR3PowerOn(PUVM pUVM);
 VMMR3DECL(int)          VMR3Suspend(PUVM pUVM, VMSUSPENDREASON enmReason);
 VMMR3DECL(VMSUSPENDREASON) VMR3GetSuspendReason(PUVM);
 VMMR3DECL(int)          VMR3Resume(PUVM pUVM, VMRESUMEREASON enmReason);
+VMMR3_INT_DECL(int)     VMR3ResumeIf(PUVM pUVM, VMRESUMEREASON enmReason,
+                                     PFNVMRESUMECHECK pfnCheck, void *pvUser);
 VMMR3DECL(VMRESUMEREASON) VMR3GetResumeReason(PUVM);
 VMMR3DECL(int)          VMR3Reset(PUVM pUVM);
 VMMR3_INT_DECL(VBOXSTRICTRC) VMR3ResetFF(PVM pVM);

@@ -1310,6 +1310,22 @@ VMMR3DECL(VMSUSPENDREASON) VMR3GetSuspendReason(PUVM pUVM)
 
 
 /**
+ * Arguments kept alive by the synchronous resume rendezvous.
+ */
+typedef struct VMRESUMEREQ
+{
+    /** The resume reason. */
+    VMRESUMEREASON      enmReason;
+    /** Optional ownership check, run on the first EMT immediately before the state transition. */
+    PFNVMRESUMECHECK    pfnCheck;
+    /** User argument for pfnCheck. */
+    void               *pvUser;
+} VMRESUMEREQ;
+/** Pointer to resume rendezvous arguments. */
+typedef VMRESUMEREQ *PVMRESUMEREQ;
+
+
+/**
  * EMT rendezvous worker for VMR3Resume.
  *
  * @returns VERR_VM_INVALID_VM_STATE or VINF_EM_RESUME. (This is a strict
@@ -1321,8 +1337,8 @@ VMMR3DECL(VMSUSPENDREASON) VMR3GetSuspendReason(PUVM pUVM)
  */
 static DECLCALLBACK(VBOXSTRICTRC) vmR3Resume(PVM pVM, PVMCPU pVCpu, void *pvUser)
 {
-    VMRESUMEREASON enmReason = (VMRESUMEREASON)(uintptr_t)pvUser;
-    LogFlow(("vmR3Resume: pVM=%p pVCpu=%p/#%u enmReason=%d\n", pVM, pVCpu, pVCpu->idCpu, enmReason));
+    PVMRESUMEREQ pReq = (PVMRESUMEREQ)pvUser;
+    LogFlow(("vmR3Resume: pVM=%p pVCpu=%p/#%u enmReason=%d\n", pVM, pVCpu, pVCpu->idCpu, pReq->enmReason));
 
     /*
      * The first thread thru here tries to change the state.  We shouldn't be
@@ -1330,10 +1346,16 @@ static DECLCALLBACK(VBOXSTRICTRC) vmR3Resume(PVM pVM, PVMCPU pVCpu, void *pvUser
      */
     if (pVCpu->idCpu == pVM->cCpus - 1)
     {
+        if (pReq->pfnCheck)
+        {
+            int rc = pReq->pfnCheck(pVM->pUVM, pReq->pvUser);
+            if (RT_FAILURE(rc))
+                return rc;
+        }
         int rc = vmR3TrySetState(pVM, "VMR3Resume", 1, VMSTATE_RESUMING, VMSTATE_SUSPENDED);
         if (RT_FAILURE(rc))
             return rc;
-        pVM->pUVM->vm.s.enmResumeReason = enmReason;
+        pVM->pUVM->vm.s.enmResumeReason = pReq->enmReason;
     }
 
     VMSTATE enmVMState = VMR3GetState(pVM);
@@ -1364,6 +1386,28 @@ static DECLCALLBACK(VBOXSTRICTRC) vmR3Resume(PVM pVM, PVMCPU pVCpu, void *pvUser
 
 
 /**
+ * Common implementation of VMR3Resume and VMR3ResumeIf.
+ */
+static int vmR3ResumeCommon(PUVM pUVM, VMRESUMEREASON enmReason, PFNVMRESUMECHECK pfnCheck, void *pvUser)
+{
+    LogFlow(("vmR3ResumeCommon: pUVM=%p\n", pUVM));
+    UVM_ASSERT_VALID_EXT_RETURN(pUVM, VERR_INVALID_VM_HANDLE);
+    PVM pVM = pUVM->pVM;
+    VM_ASSERT_VALID_EXT_RETURN(pVM, VERR_INVALID_VM_HANDLE);
+    AssertReturn(enmReason > VMRESUMEREASON_INVALID && enmReason < VMRESUMEREASON_END, VERR_INVALID_PARAMETER);
+
+    VMRESUMEREQ Req;
+    Req.enmReason = enmReason;
+    Req.pfnCheck  = pfnCheck;
+    Req.pvUser    = pvUser;
+    int rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_DESCENDING | VMMEMTRENDEZVOUS_FLAGS_STOP_ON_ERROR,
+                                vmR3Resume, &Req);
+    LogFlow(("vmR3ResumeCommon: returns %Rrc\n", rc));
+    return rc;
+}
+
+
+/**
  * Resume VM execution.
  *
  * @returns VBox status code. When called on EMT, this will be a strict status
@@ -1378,20 +1422,25 @@ static DECLCALLBACK(VBOXSTRICTRC) vmR3Resume(PVM pVM, PVMCPU pVCpu, void *pvUser
  */
 VMMR3DECL(int) VMR3Resume(PUVM pUVM, VMRESUMEREASON enmReason)
 {
-    LogFlow(("VMR3Resume: pUVM=%p\n", pUVM));
-    UVM_ASSERT_VALID_EXT_RETURN(pUVM, VERR_INVALID_VM_HANDLE);
-    PVM pVM = pUVM->pVM;
-    VM_ASSERT_VALID_EXT_RETURN(pVM, VERR_INVALID_VM_HANDLE);
-    AssertReturn(enmReason > VMRESUMEREASON_INVALID && enmReason < VMRESUMEREASON_END, VERR_INVALID_PARAMETER);
+    return vmR3ResumeCommon(pUVM, enmReason, NULL /*pfnCheck*/, NULL /*pvUser*/);
+}
 
-    /*
-     * Gather all the EMTs to make sure there are no races before
-     * changing the VM state.
-     */
-    int rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_DESCENDING | VMMEMTRENDEZVOUS_FLAGS_STOP_ON_ERROR,
-                                vmR3Resume, (void *)(uintptr_t)enmReason);
-    LogFlow(("VMR3Resume: returns %Rrc\n", rc));
-    return rc;
+
+/**
+ * Resumes VM execution only if @a pfnCheck still permits it at the serialized
+ * VM-state transition.
+ *
+ * @returns VBox status code, including the check's failure status.
+ * @param   pUVM        The user mode VM handle.
+ * @param   enmReason   The reason for resuming.
+ * @param   pfnCheck    Ownership check run on the first EMT in the rendezvous.
+ * @param   pvUser      User argument for pfnCheck.
+ * @thread  Any thread.
+ */
+VMMR3_INT_DECL(int) VMR3ResumeIf(PUVM pUVM, VMRESUMEREASON enmReason, PFNVMRESUMECHECK pfnCheck, void *pvUser)
+{
+    AssertPtrReturn(pfnCheck, VERR_INVALID_POINTER);
+    return vmR3ResumeCommon(pUVM, enmReason, pfnCheck, pvUser);
 }
 
 
