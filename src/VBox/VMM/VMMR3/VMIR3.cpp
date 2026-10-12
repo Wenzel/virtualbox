@@ -230,7 +230,37 @@ static bool vmiR3IsPausedByClient(PVMIR3 pThis)
 }
 
 
-static int vmiR3CheckPauseResume(PUVM pUVM, bool fPause, bool *pfDone);
+/**
+ * State captured for the disconnect's conditional resume.
+ */
+typedef struct VMIR3RESUMECHECK
+{
+    /** The session being cleaned up. */
+    PVMIR3     pThis;
+    /** The resume generation owned by its pause. */
+    uint32_t   cResumesAtPause;
+} VMIR3RESUMECHECK;
+
+
+/**
+ * Verifies pause ownership on the first EMT in VMR3ResumeIf's rendezvous.
+ *
+ * No other suspend or resume rendezvous can interleave between this check and
+ * the transition to Resuming.
+ */
+static DECLCALLBACK(int) vmiR3ResumeCheckOnEmt(PUVM pUVM, void *pvUser)
+{
+    VMIR3RESUMECHECK const *pCheck = (VMIR3RESUMECHECK const *)pvUser;
+    PVMIR3 const pThis = pCheck->pThis;
+    if (   pThis->fPausedByClient
+        && pThis->cResumesAtPause == pCheck->cResumesAtPause
+        && ASMAtomicReadU32(&pThis->cResumes) == pCheck->cResumesAtPause
+        && VMR3GetStateU(pUVM) == VMSTATE_SUSPENDED
+        && VMR3GetSuspendReason(pUVM) == VMSUSPENDREASON_USER
+        && !VMR3TeleportedAndNotFullyResumedYet(pUVM->pVM))
+        return VINF_SUCCESS;
+    return VERR_CANCELLED;
+}
 
 
 /**
@@ -244,19 +274,13 @@ static void vmiR3CleanupSession(PVMIR3 pThis)
 {
     if (vmiR3IsPausedByClient(pThis))
     {
-        bool fDone = false;
-        int rc = vmiR3CheckPauseResume(pThis->pUVM, false /*fPause*/, &fDone);
-        if (RT_SUCCESS(rc) && !fDone && vmiR3IsPausedByClient(pThis))
-        {
-            rc = VMR3Resume(pThis->pUVM, VMRESUMEREASON_USER);
-            VMSTATE const enmState = VMR3GetStateU(pThis->pUVM);
-            if (RT_SUCCESS(rc) && enmState == VMSTATE_RUNNING)
-                LogRel(("VMI: Resumed the VM paused by the disconnected client\n"));
-            else
-                LogRel(("VMI: Failed to resume the VM paused by the disconnected client: %Rrc (VM state %s)\n",
-                        rc, VMR3GetStateName(enmState)));
-        }
-        else if (RT_FAILURE(rc))
+        VMIR3RESUMECHECK Check;
+        Check.pThis           = pThis;
+        Check.cResumesAtPause = pThis->cResumesAtPause;
+        int rc = VMR3ResumeIf(pThis->pUVM, VMRESUMEREASON_USER, vmiR3ResumeCheckOnEmt, &Check);
+        if (RT_SUCCESS(rc))
+            LogRel(("VMI: Resumed the VM paused by the disconnected client\n"));
+        else if (rc != VERR_CANCELLED)
             LogRel(("VMI: Cannot resume the VM paused by the disconnected client: %Rrc (VM state %s)\n",
                     rc, VMR3GetStateName(VMR3GetStateU(pThis->pUVM))));
     }
