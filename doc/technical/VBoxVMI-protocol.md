@@ -160,15 +160,23 @@ Reply `rc`, with the connection kept:
 - `VINF_SUCCESS` (0): the VM is paused (`VMI_MSG_PAUSE`) or running
   (`VMI_MSG_RESUME`);
 - `VERR_INVALID_PARAMETER` (-2): nonempty body;
-- `VERR_VM_INVALID_VM_STATE` (-1907): the VM is neither running nor paused
-  (powering on or off, restoring or saving its state, live snapshot,
-  teleporting, ...), or, for `VMI_MSG_RESUME`, it was paused by the host's
-  power management (suspend), which resumes it itself;
+- `VERR_VM_INVALID_VM_STATE` (-1907), the request is refused; it may succeed
+  once the VM settles:
+  - the VM is neither running nor paused (powering on or off, restoring or
+    saving its state, live snapshot, teleporting, ...);
+  - VirtualBox suspended the VM briefly for a configuration change (medium or
+    network attachment), during which it still shows as running;
+  - for `VMI_MSG_RESUME`: the VM was paused by the host's power management
+    (suspend), which resumes it itself, or it is a teleport source or target
+    that only VirtualBox may resume (also a paused VM whose teleport failed,
+    until it is resumed through VirtualBox);
 - another VirtualBox status if the suspend or resume itself failed.
 
 The server records which pause is the client's: a `VMI_MSG_PAUSE` that
-suspended the VM, until the client's next `VMI_MSG_RESUME`. In this version the
-VM stays as the client left it when the client disconnects.
+suspended the VM (not one that found it paused), until the VM is resumed by
+anyone, the client's `VMI_MSG_RESUME` included. A pause by someone else after
+such a resume is not the client's. In this version the VM stays as the client
+left it when the client disconnects.
 
 ## vCPU count
 

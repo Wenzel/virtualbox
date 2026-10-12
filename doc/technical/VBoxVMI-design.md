@@ -123,19 +123,42 @@ Later commands are planned as follows:
   it through a racing pause or resume). Other states are refused with
   `VERR_VM_INVALID_VM_STATE` instead of entering the live-save variants
   (`RunningLS`), where Main drives the transitions itself.
-- Like `IConsole::Resume`, a VM suspended by the host's power management is not
-  resumed: Main resumes it when the host does.
+- Suspensions the server must not count on are refused with
+  `VERR_VM_INVALID_VM_STATE`, checked again after a failed suspend or resume:
+  - Main's suspension for a configuration change (`VMSUSPENDREASON_RECONFIG`,
+    `Console::i_suspendBeforeConfigChange`), for both commands. Main disables
+    its state callback for it, so the VM still shows as running, and resumes
+    it when the change is done. A pause would report success for a suspension
+    that ends without the client; a resume would run the VM in the middle of
+    the change and trip Main's state assertions afterwards. The window is
+    short; the client retries.
+  - Resume of a VM suspended by the host's power management, like
+    `IConsole::Resume`: Main resumes it when the host does.
+  - Resume while `VMR3TeleportedAndNotFullyResumedYet`: a teleport source,
+    suspended once its state went to the target, which owns the disks from
+    then on (only Main resumes it, if the teleport fails), and a teleport
+    target before Main's first resume. A paused VM whose teleport failed keeps
+    the flag until `VBoxManage controlvm resume` clears it; until then VBoxVMI
+    cannot resume it.
 - The server checks the VMM state, not Main's machine state: Main suspends
   the VM itself for an offline (non-live) snapshot, and a client resume in the
   short window before the save starts would resume it, failing the snapshot.
   `VBoxManage controlvm resume` refuses that, because Main is not `Paused`
   then. Accepted: the VMM has no view of Main's states, and routing pause
   through Main from the VMM would need a new callback interface.
-- The server records the pause it took for the client (`fPausedByClient`): set
-  when the client's pause suspended the VM, cleared by the client's resume and
-  at disconnect. A pause that found the VM suspended already is not the
-  client's. This is what disconnect safety needs to undo the client's pause and
-  only it.
+- The server records the pause it took for the client, exactly, for disconnect
+  safety to undo the client's pause and only it. `fPausedByClient` is set when
+  the client's pause suspended the VM (a pause that found it suspended already
+  is not the client's) and cleared by the client's resume and at disconnect.
+  A resume by anyone else ends the client's pause too, even if the VM is
+  paused again afterwards: a VM state callback (`VMR3AtStateRegister`, on the
+  EMT changing the state) counts the transitions to `Resuming`, the only way
+  from `Suspended` back to running, and the pause is still the client's only
+  while the count equals the one read before its suspend. A plain flag cleared
+  by the callback was rejected: a resume between the suspend's return and
+  setting the flag would leave it stale. Reading the count before the suspend,
+  a resume in that window can only make the client's pause look like someone
+  else's, never the reverse.
 - `VMI_MSG_VCPU_COUNT` returns `UVM::cCpus`, fixed at VM creation.
 
 ## Security
