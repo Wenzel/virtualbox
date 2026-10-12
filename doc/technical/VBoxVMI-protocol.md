@@ -53,6 +53,8 @@ connection.
 | `0x0004` | `VMI_MSG_PAUSE` | see Pause and resume | 1 |
 | `0x0005` | `VMI_MSG_RESUME` | see Pause and resume | 1 |
 | `0x0006` | `VMI_MSG_VCPU_COUNT` | see vCPU count | 1 |
+| `0x0007` | `VMI_MSG_REGS_READ` | see Registers | 1 |
+| `0x0008` | `VMI_MSG_REGS_WRITE` | see Registers | 1 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -191,6 +193,89 @@ Reply body (4 bytes):
 |-------:|-----:|---------|---------|
 | 0      | 4    | `cCpus` | Number of vCPUs, at least 1. |
 
+## Registers
+
+`VMI_MSG_REGS_READ` reads and `VMI_MSG_REGS_WRITE` writes the registers of one
+x86 vCPU, all of them in one request (`VMIX86REGS`, below).
+
+Request body: `VMIVCPUREQ` (8 bytes), followed for `VMI_MSG_REGS_WRITE` by a
+`VMIX86REGS` (400 bytes in all):
+
+| Offset | Size | Field         | Meaning |
+|-------:|-----:|---------------|---------|
+| 0      | 4    | `idCpu`       | vCPU number, below the `VMI_MSG_VCPU_COUNT` count. |
+| 4      | 4    | `u32Reserved` | 0. |
+
+Reply body: `VMIX86REGS` for `VMI_MSG_REGS_READ`, empty for `VMI_MSG_REGS_WRITE`.
+
+`VMIX86REGS` (392 bytes), every field a little endian `uint64_t` unless noted:
+
+| Offset | Size | Field | Meaning |
+|-------:|-----:|-------|---------|
+| 0      | 128  | `aGRegs[16]` | rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8 to r15 (instruction encoding order) |
+| 128    | 8    | `rip` | |
+| 136    | 8    | `rflags` | the architectural bits |
+| 144    | 8    | `cr0` | |
+| 152    | 8    | `cr2` | |
+| 160    | 8    | `cr3` | |
+| 168    | 8    | `cr4` | |
+| 176    | 8    | `msrEFER` | MSR `0xc0000080` |
+| 184    | 8    | `msrSTAR` | MSR `0xc0000081` |
+| 192    | 8    | `msrLSTAR` | MSR `0xc0000082` |
+| 200    | 8    | `msrSysEnterCs` | MSR `0x174` |
+| 208    | 8    | `msrSysEnterEsp` | MSR `0x175` |
+| 216    | 8    | `msrSysEnterEip` | MSR `0x176` |
+| 224    | 8    | `msrApicBase` | MSR `0x1b` |
+| 232    | 128  | `es`, `cs`, `ss`, `ds`, `fs`, `gs`, `ldtr`, `tr` | `VMIX86SEG` each |
+| 360    | 16   | `gdtr` | `VMIX86DTR` |
+| 376    | 16   | `idtr` | `VMIX86DTR` |
+
+`VMIX86SEG` (16 bytes): `u64Base` (8), `u32Limit` (4, in bytes, granularity
+applied), `Sel` (2, the selector), `u16Reserved` (2, 0). `VMIX86DTR` (16 bytes):
+`u64Base` (8), `cbLimit` (2), `au16Reserved` (6, 0). Segment attributes are
+not part of the protocol. An MSR the guest CPU doesn't have reads as 0.
+
+The request is served on the vCPU's EMT, between two of its guest instructions:
+a read is a consistent snapshot of that vCPU and a write changes all its
+registers at once, also while the VM runs. The VM doesn't have to be paused;
+pause it to read or write several vCPUs at the same point, or to keep a vCPU
+from running on until the registers have been written.
+
+Writes:
+
+- **All or nothing.** Every value is checked first; if any is refused,
+  nothing is written.
+- **Only changes.** A register written with its current value is not
+  touched, so writing back registers read earlier always succeeds and has no
+  side effects (no paging mode change, MSR or APIC reprogramming).
+- **Like the CPU would load them.** A changed value is refused if the CPU
+  would refuse it: RFLAGS with bit 1 clear or a reserved bit set (bits 3, 5,
+  15, 22 to 63); CR0, CR4 or EFER with a reserved bit set (for the guest CPU),
+  CR0.PG without CR0.PE, CR0.NW without CR0.CD; EFER.LMA other than CR0.PG and
+  EFER.LME, long mode without CR4.PAE, CR4.PCIDE outside long mode; CR3 with a
+  bit set above the guest's physical address width; PAE page-directory-pointer
+  entries with reserved bits set; an MSR value that `WRMSR` refuses. CR0,
+  CR3, CR4 and EFER are checked together, not in an instruction order. Paging
+  changes take effect as after `MOV` to CR0/CR3/CR4 (TLB flushed, paging mode
+  switched).
+- **Segments are raw state.** Selector, base and limit are written as given,
+  without a descriptor table load, and the segment's attributes are kept. The
+  client is responsible for a consistent state: e.g. a limit that doesn't
+  match the granularity attribute can keep the vCPU from running again (guru
+  meditation) if it is left so when the vCPU resumes.
+
+Reply `rc`, with the connection kept:
+
+- `VINF_SUCCESS` (0);
+- `VERR_INVALID_PARAMETER` (-2): wrong body size, nonzero reserved field, or
+  (write) a value the CPU would refuse, see above;
+- `VERR_INVALID_CPU_ID` (-1018): no vCPU `idCpu`;
+- `VERR_VM_INVALID_VM_STATE` (-1907), write only: the VM is neither running
+  nor paused (powering on or off, saving or restoring its state, live
+  snapshot, teleporting, ...);
+- `VERR_NOT_SUPPORTED` (-37): not an x86 VM;
+- another VirtualBox status if the vCPU could not be reached.
+
 ## Disconnecting
 
 Either side may close the socket at any time. The server then accepts the next
@@ -199,4 +284,4 @@ client.
 ## Changes
 
 - Version 1: transport, header and handshake; physical memory read and RAM
-  ranges; pause, resume and vCPU count.
+  ranges; pause, resume and vCPU count; registers.

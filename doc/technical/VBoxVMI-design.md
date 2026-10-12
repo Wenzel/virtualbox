@@ -61,11 +61,9 @@ hanging the VM teardown.
   listening socket for 1 s. Accept errors are logged at most 32 times.
 - System calls interrupted by signals (`EINTR`) are retried.
 
-Later commands are planned as follows:
+A later command is planned as follows:
 
-- physical memory write: served on the server thread like reads (below);
-- full register set of one vCPU: one request to that vCPU's EMT reading or
-  writing the CPU context directly.
+- physical memory write: served on the server thread like reads (below).
 
 ## Physical memory reads
 
@@ -160,6 +158,57 @@ Later commands are planned as follows:
   a resume in that window can only make the client's pause look like someone
   else's, never the reverse.
 - `VMI_MSG_VCPU_COUNT` returns `UVM::cCpus`, fixed at VM creation.
+
+## Registers
+
+- One `VMR3ReqCallWaitU` to the vCPU's EMT per read or write, which reads or
+  writes the CPU context (`CPUMCTX`) directly, so a full register set is one
+  round trip. Not DBGF: `DBGFR3RegCpuQueryBatch` is compiled out (`#if 0`,
+  "rewrite / remove"), and the named register access `IMachineDebugger` uses
+  either stops every vCPU (`DBGFR3RegNmQueryAll`, an EMT rendezvous returning
+  every register of every vCPU) or takes a request per register, with name
+  lookups. A normal request, not a priority one: it is served where the EMT
+  processes its forced actions.
+- Running on the EMT, a request is served between two guest instructions of
+  that vCPU, so a read is a snapshot and a write is atomic for that vCPU, also
+  on a running VM. Pausing is therefore not required, unlike for the
+  per-register `IMachineDebugger` methods, which are not atomic on a running
+  VM; it is only needed for a view across vCPUs. Writes are refused unless the
+  VM is running or suspended (checked on the EMT, where it cannot change
+  under the request): while it saves, teleports or powers off, the CPU state
+  may already be saved.
+- The context is imported first (`CPUM_IMPORT_EXTRN_RET` with
+  `CPUMCTX_EXTRN_ALL`), for NEM, which may keep parts of it in the
+  hypervisor; under HM the whole state is in `CPUMCTX` in ring-3. After a
+  write, `HMNotifyGuestCtxChanged` (new) flags `HM_CHANGED_ALL_GUEST`. The
+  return to ring-3 sets that flag too, except after a host interrupt
+  (`VINF_EM_RAW_INTERRUPT`), after which the EMT may serve the request in
+  ring-3 and re-enter the guest with the old VMCS state. NEM exports every
+  part of the context that is not marked external.
+- Writes follow the guest CPU rather than DBGF's raw stores: a changed value
+  the CPU would refuse (`POPF`, `MOV` to CRx, `WRMSR`) is refused, all values
+  are checked before anything is written, and the MSRs, which only
+  `CPUMSetGuestMsr` can check, are written first and written back if anything
+  later fails. The APIC base is the last MSR, as the only one whose old value
+  may not be writable back. Unchanged registers are not touched, so writing
+  back registers read earlier always succeeds and reprograms nothing.
+- CR0, CR3, CR4 and EFER are checked as one state (EFER.LMA against CR0.PG and
+  EFER.LME, PAE for long mode), since the client writes them together and no
+  instruction order applies. A paging change is propagated like `MOV` to CRx
+  in IEM: PAE PDPTEs mapped at the new CR3, `PGMFlushTLB`, the CPUM setters,
+  `PGMChangeMode`, and `HMFlushTlb` for the guest TLB. EFER goes through
+  `CPUMSetGuestEferMsrNoChecks` (TLB flush, NXE to PGM) after the combined
+  check, as `WRMSR` cannot change EFER.LMA.
+- Segments are written as raw debugger state, like the `IMachineDebugger`
+  register setters: selector, base and limit, the hidden part marked valid
+  for the selector, attributes kept, no descriptor table load (the client may
+  write a base or limit that its table doesn't hold). GDTR and IDTR go
+  through `CPUMSetGuestGDTR`/`CPUMSetGuestIDTR`.
+- The wire format has no segment attributes: libmicrovmi, the client it was
+  made for, has none, and a client writing back attributes it never read
+  would need a read first, a second round trip.
+- RFLAGS is the architectural part only: CPUM keeps internal state (interrupt
+  shadow, ...) in the upper bits, which reads hide and writes keep.
 
 ## Security
 
