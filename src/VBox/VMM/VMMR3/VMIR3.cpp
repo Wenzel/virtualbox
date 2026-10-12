@@ -63,6 +63,8 @@
 #include <iprt/thread.h>
 #include <iprt/time.h>
 
+#include "PGMInternal.h"
+
 #include <errno.h>
 #include <poll.h>
 #include <unistd.h>
@@ -454,6 +456,108 @@ static bool vmiR3HandlePhysRead(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBo
         return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VINF_SUCCESS,
                                 pThis->abReply, (size_t)(pbData - pThis->abReply)));
+}
+
+
+/**
+ * Handles a VMI_MSG_PHYS_WRITE request.
+ *
+ * Validate the entire record before changing guest memory.  Writable PGM
+ * mappings account for shared/zero and write-monitored pages; unlike
+ * PGMR3PhysWriteExternal they reject MMIO and active access handlers.  Never
+ * fall back to that API here: it can invoke a device's MMIO write handler.
+ *
+ * @returns false if the client must be disconnected.
+ */
+static bool vmiR3HandlePhysWrite(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    uint8_t const *pbBody = (uint8_t const *)pHdr + sizeof(*pHdr);
+    uint32_t cRanges = 0;
+    if (cbBody >= sizeof(cRanges))
+        memcpy(&cRanges, pbBody, sizeof(cRanges));
+
+    int rc = cbBody >= sizeof(cRanges) && cRanges
+           && cRanges <= (cbBody - sizeof(cRanges)) / sizeof(VMIPHYSRANGE)
+           ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
+    size_t cPages = 0;
+    size_t cbData = 0;
+    if (RT_SUCCESS(rc))
+    {
+        for (uint32_t i = 0; i < cRanges; i++)
+        {
+            VMIPHYSRANGE Range;
+            memcpy(&Range, pbBody + sizeof(cRanges) + i * sizeof(Range), sizeof(Range));
+            if (   !Range.cb
+                || Range.u32Reserved
+                || Range.GCPhys + Range.cb - 1 < Range.GCPhys)
+            {
+                rc = VERR_INVALID_PARAMETER;
+                break;
+            }
+            cPages += ((Range.GCPhys + Range.cb - 1) >> GUEST_PAGE_SHIFT) - (Range.GCPhys >> GUEST_PAGE_SHIFT) + 1;
+            cbData += Range.cb;
+        }
+        if (RT_SUCCESS(rc) && cbData != cbBody - sizeof(cRanges) - cRanges * sizeof(VMIPHYSRANGE))
+            rc = VERR_INVALID_PARAMETER;
+        if (RT_SUCCESS(rc) && cPages * sizeof(int32_t) > sizeof(pThis->abReply))
+            rc = VERR_BUFFER_OVERFLOW;
+    }
+    if (RT_FAILURE(rc))
+        return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
+
+    PVM pVM = pThis->pUVM->pVM;
+    uint8_t const *pbData = pbBody + sizeof(cRanges) + cRanges * sizeof(VMIPHYSRANGE);
+    uint8_t *pbStat = pThis->abReply;
+    for (uint32_t i = 0; i < cRanges; i++)
+    {
+        VMIPHYSRANGE Range;
+        memcpy(&Range, pbBody + sizeof(cRanges) + i * sizeof(Range), sizeof(Range));
+        RTGCPHYS GCPhys = Range.GCPhys;
+        size_t cbLeft = Range.cb;
+        while (cbLeft)
+        {
+            size_t const cb = RT_MIN(cbLeft, GUEST_PAGE_SIZE - (GCPhys & GUEST_PAGE_OFFSET_MASK));
+            PGMPAGETYPE const enmType = PGMPhysGetPageType(pVM, GCPhys);
+            int32_t rcPage;
+            if (enmType == PGMPAGETYPE_INVALID)
+                rcPage = VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS;
+            else if (enmType != PGMPAGETYPE_RAM)
+                rcPage = VERR_PGM_PHYS_PAGE_RESERVED;
+            else
+            {
+                void *pvPage;
+                PGMPAGEMAPLOCK Lock;
+                rcPage = PGMR3PhysGCPhys2CCPtrExternal(pVM, GCPhys, &pvPage, &Lock);
+                if (RT_SUCCESS(rcPage))
+                {
+                    /* Delegated mappings can race handler installation or a
+                       remap; inspect the pinned page under the PGM lock. */
+                    PGM_LOCK_VOID(pVM);
+                    PPGMPAGE pPage = (PPGMPAGE)(Lock.uPageAndType & ~PGMPAGEMAPLOCK_TYPE_MASK);
+                    PPGMPAGE pCurrentPage = pgmPhysGetPageSlow(pVM, GCPhys);
+                    PGMPAGETYPE const enmMappedType = (PGMPAGETYPE)PGM_PAGE_GET_TYPE(pPage);
+                    if (   pCurrentPage == pPage
+                        && enmMappedType == PGMPAGETYPE_RAM
+                        && !PGM_PAGE_HAS_ACTIVE_HANDLERS(pPage))
+                    {
+                        memcpy(pvPage, pbData, cb);
+                        rcPage = VINF_SUCCESS;
+                    }
+                    else
+                        rcPage = !pCurrentPage ? VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS : VERR_PGM_PHYS_PAGE_RESERVED;
+                    PGM_UNLOCK(pVM);
+                    PGMPhysReleasePageMappingLock(pVM, &Lock);
+                }
+            }
+            memcpy(pbStat, &rcPage, sizeof(rcPage));
+            pbStat += sizeof(rcPage);
+            pbData += cb;
+            GCPhys += cb;
+            cbLeft -= cb;
+        }
+    }
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, VINF_SUCCESS,
+                                pThis->abReply, (size_t)(pbStat - pThis->abReply)));
 }
 
 
@@ -1019,6 +1123,8 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
     {
         case VMI_MSG_PHYS_READ:
             return vmiR3HandlePhysRead(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_PHYS_WRITE:
+            return vmiR3HandlePhysWrite(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_RAM_RANGES:
             return vmiR3HandleRamRanges(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_PAUSE:
