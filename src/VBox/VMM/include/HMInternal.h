@@ -46,6 +46,7 @@
 #include <iprt/mp.h>
 #include <iprt/avl.h>
 #include <iprt/string.h>
+#include <VBox/vmm/vmi.h>
 
 #include "VMXInternal.h"
 #include "SVMInternal.h"
@@ -1082,6 +1083,38 @@ typedef struct HMCPU
 #ifdef HM_PROFILE_EXIT_DISPATCH
     STAMPROFILEADV          StatExitDispatch;
 #endif
+
+    /** VBoxVMI write intercepts of this vCPU (VT-x only, see VMIR3.cpp).  Changed
+     *  by VMIR3 on this vCPU's EMT in ring-3, applied to the VMCS in ring-0. */
+    struct HMCPUVMI
+    {
+        /** CR write intercepts: RT_BIT_32(n) for CRn (n = 0, 3, 4). */
+        uint32_t                fCrWrites;
+        /** Number of entries in aMsrs. */
+        uint32_t                cMsrs;
+        /** MSR write intercepts, unordered.  An entry stays after its intercept is
+         *  cleared until ring-0 restored its MSR-bitmap write bit. */
+        struct
+        {
+            /** The MSR index. */
+            uint32_t            idMsr;
+            /** HM_VMI_MSR_F_XXX. */
+            uint32_t            fFlags;
+        } aMsrs[VMI_MSR_INTERCEPTS_MAX];
+        /** Set by the VM-exit handler with VINF_EM_DBG_BREAKPOINT: the write event
+         *  for VMIR3, VMI_INTERCEPT_CR_WRITE or VMI_INTERCEPT_MSR_WRITE; zero if none. */
+        uint32_t                uHitKind;
+        /** The written control register number or MSR index. */
+        uint32_t                uHitReg;
+        /** Set by VMIR3 when IEM could not execute a reported write. */
+        bool                    fSkipHit;
+        /** Instruction address and register identifying the write to execute once in VT-x. */
+        uint64_t                uSkipRip;
+        uint32_t                uSkipKind;
+        uint32_t                uSkipReg;
+        /** The value the intercepted write stores. */
+        uint64_t                uHitNew;
+    } Vmi;
 } HMCPU;
 /** Pointer to HM VMCPU instance data. */
 typedef HMCPU *PHMCPU;
@@ -1092,6 +1125,17 @@ AssertCompileMemberAlignment(HMCPU, vmx.VmcsInfo,       8);
 AssertCompileMemberAlignment(HMCPU, vmx.VmcsInfoNstGst, 8);
 AssertCompileMemberAlignment(HMCPU, svm, 8);
 AssertCompileMemberAlignment(HMCPU, Event, 8);
+
+/** @name HM_VMI_MSR_F_XXX - HMCPU::Vmi.aMsrs flags.
+ * @{ */
+/** The VBoxVMI intercept is set: writes are reported. */
+#define HM_VMI_MSR_F_ACTIVE         RT_BIT_32(0)
+/** Ring-0 set the write-exit bit in the guest VMCS's MSR bitmap. */
+#define HM_VMI_MSR_F_APPLIED        RT_BIT_32(1)
+/** VirtualBox itself lets the guest write this MSR without a VM-exit (the
+ *  write bit to restore, while HM_VMI_MSR_F_APPLIED). */
+#define HM_VMI_MSR_F_WR_ALLOWED     RT_BIT_32(2)
+/** @} */
 
 
 /**

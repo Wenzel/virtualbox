@@ -187,6 +187,14 @@ AssertCompileSize(VMIVCPUREQ, 8);
 #define VMI_INTERCEPT_BREAKPOINT    UINT32_C(1)
 /** Intercept and event kind: every instruction boundary of the vCPU. */
 #define VMI_INTERCEPT_SINGLESTEP    UINT32_C(2)
+/** Intercept and event kind: a write to control register VMIINTERCEPT::uReg
+ *  (0, 3 or 4), reported before it takes effect (VT-x only). */
+#define VMI_INTERCEPT_CR_WRITE      UINT32_C(3)
+/** Intercept and event kind: a WRMSR to MSR VMIINTERCEPT::uReg, reported
+ *  before it takes effect (VT-x only). */
+#define VMI_INTERCEPT_MSR_WRITE     UINT32_C(4)
+/** Maximum number of MSR write intercepts per vCPU. */
+#define VMI_MSR_INTERCEPTS_MAX      64
 /**
  * Request body of VMI_MSG_INTERCEPT_SET and VMI_MSG_INTERCEPT_CLEAR.
  */
@@ -196,8 +204,13 @@ typedef struct VMIINTERCEPT
     uint32_t idCpu;
     /** The intercept, VMI_INTERCEPT_XXX. */
     uint32_t uKind;
+    /** The control register number (VMI_INTERCEPT_CR_WRITE) or MSR index
+     *  (VMI_INTERCEPT_MSR_WRITE); zero for the other kinds. */
+    uint32_t uReg;
+    /** Reserved, zero. */
+    uint32_t u32Reserved;
 } VMIINTERCEPT;
-AssertCompileSize(VMIINTERCEPT, 8);
+AssertCompileSize(VMIINTERCEPT, 16);
 
 /** VMIEVENTREPLY::fFlags: deliver the intercepted #BP to the guest (breakpoint events only). */
 #define VMI_EVENT_REPLY_F_REINJECT  UINT32_C(1)
@@ -223,14 +236,20 @@ typedef struct VMIEVENT
     /** The event, VMI_INTERCEPT_XXX. */
     uint32_t uKind;
     /** Guest-physical address of the instruction at RIP (the int3, or the next
-     *  one to step), NIL_RTGCPHYS if RIP is not mapped. */
+     *  one to step), NIL_RTGCPHYS if RIP is not mapped; zero for CR and MSR
+     *  writes. */
     uint64_t GCPhys;
-    /** Instruction length of the int3; zero for a single step. */
+    /** Instruction length of the int3; zero for the other kinds. */
     uint32_t cbInstr;
-    /** Reserved, zero. */
-    uint32_t u32Reserved;
+    /** The control register number or MSR index written; zero for breakpoints
+     *  and single steps. */
+    uint32_t uReg;
+    /** The register's value before the write; zero for breakpoints and single steps. */
+    uint64_t uOld;
+    /** The value the write stores; zero for breakpoints and single steps. */
+    uint64_t uNew;
 } VMIEVENT;
-AssertCompileSize(VMIEVENT, 24);
+AssertCompileSize(VMIEVENT, 40);
 
 /**
  * A segment register in VMIX86REGS: the selector and its hidden base and

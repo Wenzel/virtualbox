@@ -286,6 +286,55 @@ changes nothing. A reset, power-off or destruction ends the park; a pause
 followed by resume does not. Disconnect clears every intercept and unblocks
 each Parked EMT without reinjection before the existing pause cleanup.
 
+## CR and MSR write intercepts
+
+These drive the vCPU's own VT-x controls (libmicrovmi ADR-0006), not DBGF's
+CR-write and WRMSR events: those are a per-VM bitmap without an owner that
+the debugger console also flips, the WRMSR one turns MSR bitmaps off so every
+MSR access of every vCPU exits, and with EPT CR0.WP and several CR4 bits do
+not exit at all.
+
+- State: `HMCPU::Vmi` holds the vCPU's CR intercept bits and up to 64 MSR
+  entries (bounded, any index). SET/CLEAR run on the vCPU's EMT like the other
+  kinds, count toward the debugger exclusion, and flag `HM_CHANGED_GUEST_CR0`,
+  `_CR4` or `_OTHER_MSRS` so ring-0 re-exports before the next VM entry.
+- CR3: `vmxHCExportGuestCR0` keeps CR3-load exiting on while the intercept is
+  set (VirtualBox drops it under EPT with guest paging).
+- CR0/CR4: the export writes an all-ones guest/host mask while the intercept
+  is set, the fixed mask otherwise. The read shadow already holds the full
+  guest value, and the guest-owned bits only change through guest writes,
+  which all exit, so switching masks at export time loses nothing. VT-x exits
+  on `MOV CR0/CR4` only when a masked bit differs from the read shadow, so
+  unchanged writes stay invisible; `CLTS`/`LMSW` exit but are not reported.
+- MSRs: ring-0 (`hmR0VmxVmiSyncMsrBitmap`, during the MSR export) sets the
+  write-exit bit of newly intercepted MSRs in the guest VMCS's bitmap,
+  remembering whether VirtualBox let the guest write it, and restores that bit
+  when the intercept is gone, dropping the entry. `hmR0VmxSetMsrPermission`,
+  the only writer of the bitmap, keeps an intercepted MSR's write exiting and
+  updates the remembered bit instead, so VirtualBox's own later changes (auto
+  load/store MSRs) survive. A cleared MSR's entry stays until that restore,
+  which is why the 64 entries count those too. Indexes outside the bitmap
+  ranges always exit and need no bitmap change.
+- Exit: the MOV-to-CR and WRMSR exit handlers check the intercept before
+  emulating, store kind, register and new value in `HMCPU::Vmi` and return
+  the debug-breakpoint status, like int3. EM routes it to `VMIR3DebugEvent`,
+  which reads the old value from the context (MSR: `CPUMQueryGuestMsr`, zero
+  on #GP) and parks.
+- After the reply the parked EMT executes the instruction once with
+  `IEMExecOne` (from the current RIP and registers, so a client's register
+  change applies). Re-entering VT-x would exit again on the same instruction,
+  and a one-shot "skip" would race with interrupts delivered on entry. A
+  reply while paused waits for the resume before executing. With single step
+  set the EMT then returns the stepped status, so the step event follows the
+  write event. Should IEM not implement the instruction, a one-shot skip lets
+  the VT-x exit handler execute it without a second event.
+- Disconnect clears the CR and MSR intercepts on each EMT (ring-0 restores the
+  masks, CR3 exiting and bitmap bits at the next entry) and releases a Parked
+  vCPU, whose write then executes.
+- AMD-V and NEM refuse these intercepts (VT-x only); writes executed by IEM
+  in ring-3 (e.g. real mode emulation) and nested-guest (VMX non-root) writes
+  are not reported.
+
 ## Security
 
 - The socket file is 0600 from its creation: Linux creates it with the mode

@@ -47,6 +47,7 @@
 #include <VBox/vmm/cpum.h>
 #include <VBox/vmm/em.h>
 #include <VBox/vmm/hm.h>
+#include <VBox/vmm/iem.h>
 #include <VBox/vmm/mm.h>
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/vmm.h>
@@ -300,38 +301,87 @@ static DECLCALLBACK(int) vmiR3ResumeCheckOnEmt(PUVM pUVM, void *pvUser)
 }
 
 #ifdef VBOX_VMM_TARGET_X86
-/** Changes an intercept on its vCPU's EMT, serialized with debugger attach. */
-static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, bool fSet)
+/**
+ * Changes an intercept on its vCPU's EMT, serialized with debugger attach.
+ *
+ * CR and MSR write intercepts are VT-x controls of this vCPU (ADR-0006): the
+ * HM_CHANGED_XXX flags make ring-0 apply them to the VMCS before the next entry.
+ *
+ * @returns VBox status code.
+ * @param   pVM     The cross context VM structure.
+ * @param   uKind   The intercept, VMI_INTERCEPT_XXX (validated).
+ * @param   uReg    The control register (0, 3, 4) or MSR index; zero otherwise.
+ * @param   fSet    Set or clear.
+ */
+static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t uReg, bool fSet)
 {
     PVMCPU pVCpu = VMMGetCpu(pVM);
-    bool *pfIntercept = uKind == VMI_INTERCEPT_BREAKPOINT ? &pVCpu->dbgf.s.fVmiBreakpoint
-                                                         : &pVCpu->dbgf.s.fVmiSingleStep;
-    if (*pfIntercept == fSet)
+    uint32_t iMsr = 0;
+    bool fIsSet;
+    switch (uKind)
+    {
+        case VMI_INTERCEPT_BREAKPOINT: fIsSet = pVCpu->dbgf.s.fVmiBreakpoint; break;
+        case VMI_INTERCEPT_SINGLESTEP: fIsSet = pVCpu->dbgf.s.fVmiSingleStep; break;
+        case VMI_INTERCEPT_CR_WRITE:   fIsSet = RT_BOOL(pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(uReg)); break;
+        default:
+            while (iMsr < pVCpu->hm.s.Vmi.cMsrs && pVCpu->hm.s.Vmi.aMsrs[iMsr].idMsr != uReg)
+                iMsr++;
+            fIsSet = iMsr < pVCpu->hm.s.Vmi.cMsrs && (pVCpu->hm.s.Vmi.aMsrs[iMsr].fFlags & HM_VMI_MSR_F_ACTIVE);
+            break;
+    }
+    if (fIsSet == fSet)
         return VINF_SUCCESS;
     if (fSet && pVM->dbgf.s.fAttached)
         return VERR_DBGF_ALREADY_ATTACHED;
-    if (fSet && uKind == VMI_INTERCEPT_SINGLESTEP
+    if (   fSet
+        && uKind != VMI_INTERCEPT_BREAKPOINT
         && (   !HMR3IsVmxEnabled(pVM->pUVM)
-            || !(pVM->hm.s.ForR3.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG)))
+            || (   uKind == VMI_INTERCEPT_SINGLESTEP
+                && !(pVM->hm.s.ForR3.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG))))
         return VERR_NOT_SUPPORTED;
-    *pfIntercept = fSet;
+    switch (uKind)
+    {
+        case VMI_INTERCEPT_BREAKPOINT:
+            pVCpu->dbgf.s.fVmiBreakpoint = fSet;
+            if (fSet)
+                ASMAtomicIncU32(&pVM->dbgf.s.cVmiBreakpoints);
+            else
+                ASMAtomicDecU32(&pVM->dbgf.s.cVmiBreakpoints);
+            break;
+        case VMI_INTERCEPT_SINGLESTEP:
+            pVCpu->dbgf.s.fVmiSingleStep = fSet;
+            pVCpu->dbgf.s.fSingleSteppingRaw = fSet;
+            if (fSet)
+                pVCpu->dbgf.s.fVmiStepped = true;
+            break;
+        case VMI_INTERCEPT_CR_WRITE:
+            pVCpu->hm.s.Vmi.fCrWrites ^= RT_BIT_32(uReg);
+            /* The CR0 export also decides CR3-load exiting. */
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR0 | HM_CHANGED_GUEST_CR4);
+            break;
+        default:
+            if (fSet)
+            {
+                if (iMsr == pVCpu->hm.s.Vmi.cMsrs)
+                {
+                    /* Entries of cleared intercepts count until ring-0 restored their bitmap bit. */
+                    if (iMsr >= RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs))
+                        return VERR_OUT_OF_RESOURCES;
+                    pVCpu->hm.s.Vmi.aMsrs[iMsr].idMsr  = uReg;
+                    pVCpu->hm.s.Vmi.aMsrs[iMsr].fFlags = 0;
+                    pVCpu->hm.s.Vmi.cMsrs++;
+                }
+                pVCpu->hm.s.Vmi.aMsrs[iMsr].fFlags |= HM_VMI_MSR_F_ACTIVE;
+            }
+            else
+                pVCpu->hm.s.Vmi.aMsrs[iMsr].fFlags &= ~HM_VMI_MSR_F_ACTIVE; /* Ring-0 restores the bitmap, drops the entry. */
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_OTHER_MSRS);
+            break;
+    }
     if (fSet)
         ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts);
     else
         ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
-    if (uKind == VMI_INTERCEPT_BREAKPOINT)
-    {
-        if (fSet)
-            ASMAtomicIncU32(&pVM->dbgf.s.cVmiBreakpoints);
-        else
-            ASMAtomicDecU32(&pVM->dbgf.s.cVmiBreakpoints);
-    }
-    else
-    {
-        pVCpu->dbgf.s.fSingleSteppingRaw = fSet;
-        if (fSet)
-            pVCpu->dbgf.s.fVmiStepped = true;
-    }
     return VINF_SUCCESS;
 }
 #endif /* VBOX_VMM_TARGET_X86 */
@@ -342,8 +392,14 @@ static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
 {
 #ifdef VBOX_VMM_TARGET_X86
     PVMCPU pVCpu = VMMGetCpu(pVM);
-    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_BREAKPOINT, false);
-    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_SINGLESTEP, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_BREAKPOINT, 0, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_SINGLESTEP, 0, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_CR_WRITE, 0, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_CR_WRITE, 3, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_CR_WRITE, 4, false);
+    for (uint32_t i = 0; i < pVCpu->hm.s.Vmi.cMsrs; i++) /* Clearing keeps the entries, see above. */
+        vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_MSR_WRITE, pVCpu->hm.s.Vmi.aMsrs[i].idMsr, false);
+    pVCpu->hm.s.Vmi.fSkipHit = false;
     pThis->paCpus[pVCpu->idCpu].fParked = false;
 #else
     RT_NOREF(pVM, pThis);
@@ -1265,26 +1321,46 @@ static void vmiR3Wakeup(PVMIR3 pThis)
  * staying parked), until the reply, the end of the session or VM termination.
  *
  * @returns Strict VBox status code for EM: VINF_EM_RESCHEDULE or
- *          VINF_EM_SUSPEND to continue, or the status ending the park
+ *          VINF_EM_SUSPEND to continue, VINF_EM_DBG_STEPPED after a CR or MSR
+ *          write executed while single stepping, or the status ending the park
  *          (VINF_EM_OFF, VINF_EM_RESET, VINF_EM_TERMINATE, failure).
  * @param   pVM     The cross context VM structure.
  * @param   pVCpu   The cross context virtual CPU structure of the calling EMT.
- * @param   uKind   The event kind, VMI_INTERCEPT_BREAKPOINT or VMI_INTERCEPT_SINGLESTEP.
+ * @param   uKind   The event kind, VMI_INTERCEPT_XXX.  For CR and MSR writes the
+ *                  VM-exit handler left the register and new value in
+ *                  HMCPU::Vmi; the write executes here after the reply.
  */
 VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKind)
 {
     PVMIR3 pThis = (PVMIR3)pVM->pUVM->vm.s.pvVMI;
     if (!pThis || !pThis->fHandshaked)
-        return VINF_EM_RESCHEDULE;
+        return VINF_EM_RESCHEDULE; /* A pending write re-executes, its intercept is cleared already. */
 
     VMIEVENT Event;
     RT_ZERO(Event);
     Event.idCpu = pVCpu->idCpu;
     Event.uKind = uKind;
-    /* An unmapped RIP (a step onto a page not faulted in yet) is reported, not fatal to EM. */
-    int rc = PGMPhysGCPtr2GCPhys(pVCpu, CPUMGetGuestFlatPC(pVCpu), &Event.GCPhys);
-    if (RT_FAILURE(rc))
-        Event.GCPhys = NIL_RTGCPHYS;
+    bool const fWrite = uKind == VMI_INTERCEPT_CR_WRITE || uKind == VMI_INTERCEPT_MSR_WRITE;
+    int rc = VINF_SUCCESS;
+    if (fWrite)
+    {
+#ifdef VBOX_VMM_TARGET_X86
+        Event.uReg = pVCpu->hm.s.Vmi.uHitReg;
+        Event.uNew = pVCpu->hm.s.Vmi.uHitNew;
+        if (uKind == VMI_INTERCEPT_MSR_WRITE)
+            Event.uOld = vmiR3QueryMsr(pVCpu, Event.uReg);
+        else
+            Event.uOld = Event.uReg == 0 ? CPUMGetGuestCR0(pVCpu)
+                       : Event.uReg == 3 ? CPUMGetGuestCR3(pVCpu) : CPUMGetGuestCR4(pVCpu);
+#endif
+    }
+    else
+    {
+        /* An unmapped RIP (a step onto a page not faulted in yet) is reported, not fatal to EM. */
+        rc = PGMPhysGCPtr2GCPhys(pVCpu, CPUMGetGuestFlatPC(pVCpu), &Event.GCPhys);
+        if (RT_FAILURE(rc))
+            Event.GCPhys = NIL_RTGCPHYS;
+    }
     if (uKind == VMI_INTERCEPT_BREAKPOINT)
     {
         DISSTATE Dis;
@@ -1307,7 +1383,9 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
     RTSemFastMutexRelease(pThis->hMtxEvents);
     vmiR3Wakeup(pThis);
 
-    while (pThis->paCpus[idCpu].fParked)
+    /* A write waits for the resume too: it must not execute while the VM is paused. */
+    while (   pThis->paCpus[idCpu].fParked
+           || (fWrite && VMR3GetState(pVM) >= VMSTATE_SUSPENDED && VMR3GetState(pVM) <= VMSTATE_SUSPENDED_EXT_LS))
     {
         if (VM_FF_IS_SET(pVM, VM_FF_EMT_RENDEZVOUS))
             rc = VMMR3EmtRendezvousFF(pVM, pVCpu);
@@ -1342,6 +1420,33 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
             return rc;
         TRPMSetInstrLength(pVCpu, (uint8_t)pThis->paCpus[idCpu].cbInstr);
     }
+
+#ifdef VBOX_VMM_TARGET_X86
+
+    if (fWrite)
+    {
+        /* Execute the write here: back in VT-x it would exit again.  The client may have changed its source register. */
+        IEMTlbInvalidateAll(pVCpu);
+        VBOXSTRICTRC rcStrict = IEMExecOne(pVCpu);
+        if (rcStrict == VERR_IEM_INSTR_NOT_IMPLEMENTED || rcStrict == VERR_IEM_ASPECT_NOT_IMPLEMENTED)
+        {
+            /* Let VT-x execute this write once if IEM cannot handle it. */
+            pVCpu->hm.s.Vmi.uSkipRip  = pVCpu->cpum.GstCtx.rip;
+            pVCpu->hm.s.Vmi.uSkipKind = Event.uKind;
+            pVCpu->hm.s.Vmi.uSkipReg  = Event.uReg;
+            pVCpu->hm.s.Vmi.fSkipHit  = true;
+            return VINF_EM_RESCHEDULE;
+        }
+        if (   RT_FAILURE(rcStrict)
+            || (   rcStrict >= VINF_EM_FIRST
+                && rcStrict <= VINF_EM_LAST
+                && rcStrict != VINF_EM_RESCHEDULE /* == VINF_IEM_RAISED_XCPT, the guest got its #GP */))
+            return rcStrict;
+        /* Other informational statuses (PGM syncs) come with force flags HM handles. */
+        return pVCpu->dbgf.s.fVmiSingleStep ? VINF_EM_DBG_STEPPED : VINF_EM_RESCHEDULE;
+    }
+
+#endif /* VBOX_VMM_TARGET_X86 */
     /* Suspended meanwhile, live save or snapshot included: the vCPU continues on resume. */
     switch (VMR3GetState(pVM))
     {
@@ -1363,14 +1468,21 @@ static bool vmiR3HandleIntercept(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
     if (RT_SUCCESS(rc))
     {
         memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
-        if (Req.idCpu >= pThis->pUVM->cCpus)
+        if (Req.u32Reserved)
+            rc = VERR_INVALID_PARAMETER;
+        else if (Req.idCpu >= pThis->pUVM->cCpus)
             rc = VERR_INVALID_CPU_ID;
-        else if (Req.uKind != VMI_INTERCEPT_BREAKPOINT && Req.uKind != VMI_INTERCEPT_SINGLESTEP)
+        else if (   (Req.uKind == VMI_INTERCEPT_BREAKPOINT || Req.uKind == VMI_INTERCEPT_SINGLESTEP)
+                 && Req.uReg)
+            rc = VERR_INVALID_PARAMETER;
+        else if (   Req.uKind < VMI_INTERCEPT_BREAKPOINT
+                 || Req.uKind > VMI_INTERCEPT_MSR_WRITE
+                 || (Req.uKind == VMI_INTERCEPT_CR_WRITE && Req.uReg != 0 && Req.uReg != 3 && Req.uReg != 4))
             rc = VERR_NOT_SUPPORTED;
 #ifdef VBOX_VMM_TARGET_X86
         else
-            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3InterceptOnEmt, 3,
-                                  pThis->pUVM->pVM, Req.uKind, pHdr->uType == VMI_MSG_INTERCEPT_SET);
+            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3InterceptOnEmt, 4,
+                                  pThis->pUVM->pVM, Req.uKind, Req.uReg, pHdr->uType == VMI_MSG_INTERCEPT_SET);
 #else
         else
             rc = VERR_NOT_SUPPORTED;

@@ -58,6 +58,9 @@
 #ifdef VBOX_WITH_VMI
 # include <VBox/vmm/vmi.h>
 # include "DBGFInternal.h"
+# ifdef VBOX_VMM_TARGET_X86
+#  include "HMInternal.h"
+# endif
 #endif
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/pdmapic.h>
@@ -995,6 +998,15 @@ static VBOXSTRICTRC emR3Debug(PVM pVM, PVMCPU pVCpu, VBOXSTRICTRC rc)
                        ? VMIR3DebugEvent(pVM, pVCpu, VMI_INTERCEPT_BREAKPOINT)
                        : VINF_EM_RESCHEDULE;
                 }
+# ifdef VBOX_VMM_TARGET_X86
+                else if (pVCpu->hm.s.Vmi.uHitKind)
+                {
+                    /* A VT-x exit on a VBoxVMI CR or MSR write intercept. */
+                    uint32_t const uKind = pVCpu->hm.s.Vmi.uHitKind;
+                    pVCpu->hm.s.Vmi.uHitKind = 0;
+                    rc = VMIR3DebugEvent(pVM, pVCpu, uKind);
+                }
+# endif
                 else
 #endif
                     rc = DBGFR3BpHit(pVM, pVCpu);

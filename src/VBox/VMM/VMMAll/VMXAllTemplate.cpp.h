@@ -819,6 +819,49 @@ static uint64_t vmxHCGetFixedCr4Mask(PCVMCPUCC pVCpu)
 }
 
 
+#ifndef IN_NEM_DARWIN
+
+/**
+ * Looks up a VBoxVMI MSR write intercept entry.
+ *
+ * @returns The index in HMCPU::Vmi.aMsrs, the bounded entry count if absent.
+ * @param   pVCpu   The cross context virtual CPU structure.
+ * @param   idMsr   The MSR index.
+ */
+DECLINLINE(uint32_t) vmxHCVmiFindMsr(PCVMCPUCC pVCpu, uint32_t idMsr)
+{
+    uint32_t const cMsrs = RT_MIN(pVCpu->hm.s.Vmi.cMsrs, RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs));
+    uint32_t i = 0;
+    while (i < cMsrs && pVCpu->hm.s.Vmi.aMsrs[i].idMsr != idMsr)
+        i++;
+    return i;
+}
+
+
+/**
+ * Consumes the one-shot VBoxVMI bypass only for the write IEM could not run.
+ *
+ * @returns true if this write executes without a second VBoxVMI event.
+ * @param   pVCpu   The cross context virtual CPU structure.
+ * @param   uKind   The intercepted write kind.
+ * @param   uReg    The CR number or MSR index.
+ */
+DECLINLINE(bool) vmxHCVmiSkipHit(PVMCPUCC pVCpu, uint32_t uKind, uint32_t uReg)
+{
+    if (   pVCpu->hm.s.Vmi.fSkipHit
+        && pVCpu->hm.s.Vmi.uSkipRip == pVCpu->cpum.GstCtx.rip
+        && pVCpu->hm.s.Vmi.uSkipKind == uKind
+        && pVCpu->hm.s.Vmi.uSkipReg == uReg)
+    {
+        pVCpu->hm.s.Vmi.fSkipHit = false;
+        return true;
+    }
+    return false;
+}
+
+#endif /* !IN_NEM_DARWIN */
+
+
 /**
  * Checks whether an \#AC exception generated while executing a guest (or
  * nested-guest) was due to a split-lock memory access.
@@ -2130,6 +2173,11 @@ static int vmxHCExportGuestCR0(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
                 if (VM_IS_VMX_UNRESTRICTED_GUEST(pVM))
                     uProcCtls &= ~VMX_PROC_CTLS_CR3_STORE_EXIT;
 #endif
+#ifndef IN_NEM_DARWIN
+                /* VBoxVMI CR3 write intercept. */
+                if (pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(3))
+                    uProcCtls |= VMX_PROC_CTLS_CR3_LOAD_EXIT;
+#endif
             }
             else
             {
@@ -2205,6 +2253,16 @@ static int vmxHCExportGuestCR0(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
             /* Commit the CR0 and related fields to the guest VMCS. */
             int rc = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_GUEST_CR0, u64GuestCr0);               AssertRC(rc);
             rc     = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_CTRL_CR0_READ_SHADOW, u64ShadowCr0);   AssertRC(rc);
+#ifndef IN_NEM_DARWIN
+            /* A VBoxVMI CR0 write intercept owns every bit, so that writes of guest-owned bits (WP) exit too. */
+            uint64_t const u64Cr0Mask = pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(0) ? UINT64_MAX : vmxHCGetFixedCr0Mask(pVCpu);
+            if (u64Cr0Mask != pVmcsInfo->u64Cr0Mask)
+            {
+                rc = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_CTRL_CR0_MASK, u64Cr0Mask);
+                AssertRC(rc);
+                pVmcsInfo->u64Cr0Mask = u64Cr0Mask;
+            }
+#endif
             if (uProcCtls != pVmcsInfo->u32ProcCtls)
             {
                 rc = VMX_VMCS_WRITE_32(pVCpu, VMX_VMCS32_CTRL_PROC_EXEC, uProcCtls);
@@ -2486,6 +2544,19 @@ static VBOXSTRICTRC vmxHCExportGuestCR3AndCR4(PVMCPUCC pVCpu, PCVMXTRANSIENT pVm
         /* Commit the CR4 and CR4 read-shadow to the guest VMCS. */
         rc = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_GUEST_CR4, u64GuestCr4);               AssertRC(rc);
         rc = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_CTRL_CR4_READ_SHADOW, u64ShadowCr4);   AssertRC(rc);
+#ifndef IN_NEM_DARWIN
+        /* A VBoxVMI CR4 write intercept owns every bit, see vmxHCExportGuestCR0. */
+        if (!pVmxTransient->fIsNestedGuest)
+        {
+            uint64_t const u64Cr4Mask = pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(4) ? UINT64_MAX : vmxHCGetFixedCr4Mask(pVCpu);
+            if (u64Cr4Mask != pVmcsInfo->u64Cr4Mask)
+            {
+                rc = VMX_VMCS_WRITE_NW(pVCpu, VMX_VMCS_CTRL_CR4_MASK, u64Cr4Mask);
+                AssertRC(rc);
+                pVmcsInfo->u64Cr4Mask = u64Cr4Mask;
+            }
+        }
+#endif
 
 #ifndef IN_NEM_DARWIN
         /* Whether to save/load/restore XCR0 during world switch depends on CR4.OSXSAVE and host+guest XCR0. */
@@ -8635,6 +8706,22 @@ HMVMX_EXIT_DECL vmxHCExitWrmsr(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
     }
     Log4Func(("ecx=%#RX32 edx:eax=%#RX32:%#RX32\n", idMsr, pVCpu->cpum.GstCtx.edx, pVCpu->cpum.GstCtx.eax));
 
+#ifndef IN_NEM_DARWIN
+    /* VBoxVMI MSR write intercept: report the write before it executes (VMIR3 executes it after the reply). */
+    uint32_t const iVmiMsr = vmxHCVmiFindMsr(pVCpu, idMsr);
+    if (   iVmiMsr < RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs)
+        && iVmiMsr < pVCpu->hm.s.Vmi.cMsrs
+        && (pVCpu->hm.s.Vmi.aMsrs[iVmiMsr].fFlags & HM_VMI_MSR_F_ACTIVE)
+        && !pVmxTransient->fIsNestedGuest
+        && !vmxHCVmiSkipHit(pVCpu, VMI_INTERCEPT_MSR_WRITE, idMsr))
+    {
+        pVCpu->hm.s.Vmi.uHitKind = VMI_INTERCEPT_MSR_WRITE;
+        pVCpu->hm.s.Vmi.uHitReg  = idMsr;
+        pVCpu->hm.s.Vmi.uHitNew  = RT_MAKE_U64(pVCpu->cpum.GstCtx.eax, pVCpu->cpum.GstCtx.edx);
+        return VINF_EM_DBG_BREAKPOINT;
+    }
+#endif
+
     VBOXSTRICTRC rcStrict = IEMExecDecodedWrmsr(pVCpu, pVmxTransient->cbExitInstr);
     STAM_COUNTER_INC(&VCPU_2_VMXSTATS(pVCpu).StatExitWrmsr);
 
@@ -8843,7 +8930,8 @@ HMVMX_EXIT_DECL vmxHCExitMovCRx(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
             Assert(   iCrReg != 3
                    || !VM_IS_VMX_NESTED_PAGING(pVM)
                    || !CPUMIsGuestPagingEnabledEx(&pVCpu->cpum.GstCtx)
-                   || pVCpu->hmr0.s.fUsingDebugLoop);
+                   || pVCpu->hmr0.s.fUsingDebugLoop
+                   || (pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(3)));
 # else
             Assert(   iCrReg != 3
                    || !CPUMIsGuestPagingEnabledEx(&pVCpu->cpum.GstCtx));
@@ -8853,6 +8941,26 @@ HMVMX_EXIT_DECL vmxHCExitMovCRx(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransient)
             /* MOV to CR8 writes only cause VM-exits when TPR shadow is not used. */
             Assert(   iCrReg != 8
                    || !(pVmcsInfo->u32ProcCtls & VMX_PROC_CTLS_USE_TPR_SHADOW));
+
+#ifndef IN_NEM_DARWIN
+            /* VBoxVMI CR write intercept: report the write before it executes (VMIR3 executes it after the reply). */
+            if (   (pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(iCrReg))
+                && !pVmxTransient->fIsNestedGuest
+                && !vmxHCVmiSkipHit(pVCpu, VMI_INTERCEPT_CR_WRITE, iCrReg))
+            {
+                uint64_t uNew = CPUMIsGuestIn64BitCodeEx(&pVCpu->cpum.GstCtx)
+                              ? pVCpu->cpum.GstCtx.aGRegs[iGReg].u : (uint32_t)pVCpu->cpum.GstCtx.aGRegs[iGReg].u;
+                if (iCrReg == 0)
+                    uNew |= X86_CR0_ET;         /* Hardwired, as IEM's CR0 load does. */
+                else if (iCrReg == 3)
+                    uNew &= ~RT_BIT_64(63);     /* The PCID no-flush bit is not stored. */
+                pVCpu->hm.s.Vmi.uHitKind = VMI_INTERCEPT_CR_WRITE;
+                pVCpu->hm.s.Vmi.uHitReg  = iCrReg;
+                pVCpu->hm.s.Vmi.uHitNew  = uNew;
+                STAM_PROFILE_ADV_STOP(&VCPU_2_VMXSTATS(pVCpu).StatExitMovCRx, y2);
+                return VINF_EM_DBG_BREAKPOINT;
+            }
+#endif
 
             rcStrict = vmxHCExitMovToCrX(pVCpu, pVmxTransient->cbExitInstr, iGReg, iCrReg);
             AssertMsg(   rcStrict == VINF_SUCCESS

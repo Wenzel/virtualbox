@@ -1182,6 +1182,22 @@ static void hmR0VmxSetMsrPermission(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool
     Assert(pbMsrBitmap);
     Assert(VMXMSRPM_IS_FLAG_VALID(fMsrpm));
 
+    /* While VBoxVMI intercepts the MSR's writes, keep them exiting and record our own wish for the restore. */
+    if (!fIsNstGstVmcs)
+    {
+        uint32_t const i = vmxHCVmiFindMsr(pVCpu, idMsr);
+        if (   i < RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs)
+            && i < pVCpu->hm.s.Vmi.cMsrs
+            && (pVCpu->hm.s.Vmi.aMsrs[i].fFlags & HM_VMI_MSR_F_APPLIED))
+        {
+            if (fMsrpm & VMXMSRPM_ALLOW_WR)
+                pVCpu->hm.s.Vmi.aMsrs[i].fFlags |= HM_VMI_MSR_F_WR_ALLOWED;
+            else
+                pVCpu->hm.s.Vmi.aMsrs[i].fFlags &= ~HM_VMI_MSR_F_WR_ALLOWED;
+            fMsrpm = (fMsrpm & ~VMXMSRPM_WR_MASK) | VMXMSRPM_EXIT_WR;
+        }
+    }
+
     /*
      * MSR-bitmap Layout:
      *   Byte index            MSR range            Interpreted as
@@ -1252,6 +1268,60 @@ static void hmR0VmxSetMsrPermission(PVMCPUCC pVCpu, PVMXVMCSINFO pVmcsInfo, bool
     }
     else
         ASMBitSet(pbMsrBitmap, (offMsrWrite << 3) + iBit);
+}
+
+
+/**
+ * Applies the VBoxVMI MSR write intercepts to the guest VMCS's MSR bitmap.
+ *
+ * Clears the write passthrough of newly intercepted MSRs and restores
+ * VirtualBox's own write permission of MSRs no longer intercepted, dropping
+ * their entries.  MSRs outside the bitmap ranges always exit.
+ *
+ * @param   pVCpu   The cross context virtual CPU structure.
+ * @remarks Can be called with interrupts disabled.
+ */
+static void hmR0VmxVmiSyncMsrBitmap(PVMCPUCC pVCpu)
+{
+    PVMXVMCSINFO const pVmcsInfo = &pVCpu->hmr0.s.vmx.VmcsInfo;
+    if (RT_UNLIKELY(pVCpu->hm.s.Vmi.cMsrs > RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs)))
+    {
+        AssertMsgFailed(("Invalid VBoxVMI MSR count: %u\n", pVCpu->hm.s.Vmi.cMsrs));
+        pVCpu->hm.s.Vmi.cMsrs = RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs);
+    }
+    uint32_t i = 0;
+    while (i < pVCpu->hm.s.Vmi.cMsrs)
+    {
+        uint32_t const idMsr   = pVCpu->hm.s.Vmi.aMsrs[i].idMsr;
+        uint32_t const fFlags  = pVCpu->hm.s.Vmi.aMsrs[i].fFlags;
+        bool const     fBitmap =    pVmcsInfo->pvMsrBitmap
+                                 && (   idMsr <= UINT32_C(0x00001fff)
+                                     || idMsr - UINT32_C(0xc0000000) <= UINT32_C(0x00001fff));
+        if (fFlags & HM_VMI_MSR_F_ACTIVE)
+        {
+            if (fBitmap && !(fFlags & HM_VMI_MSR_F_APPLIED))
+            {
+                uint32_t const fMsrpm = CPUMGetVmxMsrPermission(pVmcsInfo->pvMsrBitmap, idMsr);
+                hmR0VmxSetMsrPermission(pVCpu, pVmcsInfo, false /* fIsNstGstVmcs */, idMsr,
+                                        (fMsrpm & VMXMSRPM_RD_MASK) | VMXMSRPM_EXIT_WR);
+                pVCpu->hm.s.Vmi.aMsrs[i].fFlags = fFlags | HM_VMI_MSR_F_APPLIED
+                                                | (fMsrpm & VMXMSRPM_ALLOW_WR ? HM_VMI_MSR_F_WR_ALLOWED : 0);
+            }
+            i++;
+        }
+        else
+        {
+            if (fFlags & HM_VMI_MSR_F_APPLIED)
+            {
+                pVCpu->hm.s.Vmi.aMsrs[i].fFlags = 0; /* Before the call: the restore must not be redirected. */
+                uint32_t const fMsrpm = CPUMGetVmxMsrPermission(pVmcsInfo->pvMsrBitmap, idMsr);
+                hmR0VmxSetMsrPermission(pVCpu, pVmcsInfo, false /* fIsNstGstVmcs */, idMsr,
+                                          (fMsrpm & VMXMSRPM_RD_MASK)
+                                        | (fFlags & HM_VMI_MSR_F_WR_ALLOWED ? VMXMSRPM_ALLOW_WR : VMXMSRPM_EXIT_WR));
+            }
+            pVCpu->hm.s.Vmi.aMsrs[i] = pVCpu->hm.s.Vmi.aMsrs[--pVCpu->hm.s.Vmi.cMsrs];
+        }
+    }
 }
 
 
@@ -1635,8 +1705,15 @@ static void hmR0VmxCheckAutoLoadStoreMsrs(PVMCPUCC pVCpu, PCVMXVMCSINFO pVmcsInf
                 }
                 else if (!fIsNstGstVmcs)
                 {
-                    AssertMsgReturnVoid((fMsrpm & VMXMSRPM_MASK) == VMXMSRPM_ALLOW_RD_WR,
-                                        ("u32Msr=%#RX32 cMsrs=%u No passthru read/write!\n", pGuestMsrLoad->u32Msr, cMsrs));
+                    uint32_t const iVmiMsr = vmxHCVmiFindMsr(pVCpu, pGuestMsrLoad->u32Msr);
+                    bool const fVmiWriteExit =    iVmiMsr < RT_ELEMENTS(pVCpu->hm.s.Vmi.aMsrs)
+                                               && iVmiMsr < pVCpu->hm.s.Vmi.cMsrs
+                                               && (pVCpu->hm.s.Vmi.aMsrs[iVmiMsr].fFlags & HM_VMI_MSR_F_APPLIED);
+                    AssertMsgReturnVoid((fMsrpm & VMXMSRPM_RD_MASK) == VMXMSRPM_ALLOW_RD
+                                        && (fMsrpm & VMXMSRPM_WR_MASK)
+                                           == (fVmiWriteExit ? VMXMSRPM_EXIT_WR : VMXMSRPM_ALLOW_WR),
+                                        ("u32Msr=%#RX32 cMsrs=%u Unexpected auto-load MSR permissions!\n",
+                                         pGuestMsrLoad->u32Msr, cMsrs));
                 }
                 else
                 {
@@ -4184,6 +4261,9 @@ static int hmR0VmxExportGuestMsrs(PVMCPUCC pVCpu, PCVMXTRANSIENT pVmxTransient)
      */
     if (ASMAtomicUoReadU64(&pVCpu->hm.s.fCtxChanged) & HM_CHANGED_GUEST_OTHER_MSRS)
     {
+        /* VBoxVMI MSR write intercepts (VMIR3 flags HM_CHANGED_GUEST_OTHER_MSRS when changing them). */
+        hmR0VmxVmiSyncMsrBitmap(pVCpu);
+
         /* Speculation Control (R/W). */
         HMVMX_CPUMCTX_ASSERT(pVCpu, HM_CHANGED_GUEST_OTHER_MSRS);
         if (pVM->cpum.ro.GuestFeatures.fIbrs && g_CpumHostFeatures.s.fIbrs)

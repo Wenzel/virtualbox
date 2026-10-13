@@ -328,39 +328,81 @@ Reply `rc`, with the connection kept:
 
 ## Intercepts and events
 
-`VMI_MSG_INTERCEPT_SET` and `VMI_MSG_INTERCEPT_CLEAR` have an 8-byte
+`VMI_MSG_INTERCEPT_SET` and `VMI_MSG_INTERCEPT_CLEAR` have a 16-byte
 `VMIINTERCEPT` request body: `u32 idCpu` at offset 0, `u32 uKind` at offset
-4. Kind 1 is `VMI_INTERCEPT_BREAKPOINT` (#BP from an int3); kind 2 is
-`VMI_INTERCEPT_SINGLESTEP`. Their replies have empty bodies. Setting an
-already-set intercept or clearing an unset intercept succeeds. These commands
-work while running or paused, including before replying to that vCPU's event.
-SET returns `VERR_DBGF_ALREADY_ATTACHED` (-1201) if the VirtualBox debugger
-is attached. CLEAR still works. Both return `VERR_INVALID_PARAMETER` (-2) for
-a wrong body size, `VERR_INVALID_CPU_ID` (-1018) for an unknown vCPU, or
-`VERR_NOT_SUPPORTED` (-37) for an unknown kind or a non-x86 VM. Single-step
-SET also returns -37 unless the VM runs on VT-x with the monitor trap flag;
-AMD-V and NEM stepping would alter guest-visible debug state and are refused.
-While any intercept is set, the VirtualBox debugger cannot attach
+4, `u32 uReg` at offset 8 and a reserved `u32` at offset 12 that must be zero.
+The kinds:
+
+| `uKind` | Name | `uReg` |
+|---|---|---|
+| 1 | `VMI_INTERCEPT_BREAKPOINT` (#BP from an int3) | 0 |
+| 2 | `VMI_INTERCEPT_SINGLESTEP` | 0 |
+| 3 | `VMI_INTERCEPT_CR_WRITE` | control register: 0, 3 or 4 |
+| 4 | `VMI_INTERCEPT_MSR_WRITE` | MSR index, any `u32` |
+
+Each (vCPU, kind, `uReg`) is a separate intercept. Their replies have empty
+bodies. Setting an already-set intercept or clearing an unset intercept
+succeeds. These commands work while running or paused, including before
+replying to that vCPU's event. SET returns `VERR_DBGF_ALREADY_ATTACHED` (-1201)
+if the VirtualBox debugger is attached. CLEAR still works. Both return
+`VERR_INVALID_PARAMETER` (-2) for a wrong body size, a nonzero reserved field
+or a nonzero `uReg` with kinds 1 and 2, `VERR_INVALID_CPU_ID` (-1018) for an
+unknown vCPU, or `VERR_NOT_SUPPORTED` (-37) for an unknown kind, a control
+register other than 0, 3 and 4, or a non-x86 VM. Single-step, CR and MSR SET
+also return -37 unless the VM runs on VT-x (single step: with the monitor trap
+flag); AMD-V and NEM stepping would alter guest-visible debug state, and they
+lack the per-vCPU exit controls CR and MSR intercepts need. A vCPU holds at
+most 64 MSR intercepts; SET of another one returns `VERR_OUT_OF_RESOURCES`
+(-80). While any intercept is set, the VirtualBox debugger cannot attach
 (`VERR_DBGF_VMI_INTERCEPTS_ACTIVE`, -1242).
 
+Only the intercepted vCPUs and registers exit: a CR3 intercept turns on
+CR3-load exiting, a CR0 or CR4 intercept makes the vCPU's guest/host mask
+cover every bit of the register (so writes of bits VirtualBox otherwise leaves
+to the guest, such as CR0.WP or CR4.TSD, are reported), and an MSR intercept
+clears the write passthrough of that MSR in the vCPU's MSR bitmap (reads and
+other MSRs do not exit). Clearing restores what VirtualBox itself uses.
+
 `VMI_MSG_EVENT` is unsolicited from server to client: header `idReq` 0,
-`fFlags` 0, `rc` 0; body `VMIEVENT` is 24 bytes: `u32 idCpu` at 0,
-`u32 uKind` at 4, `u64 GCPhys` at 8, `u32 cbInstr` at 16, and reserved
-`u32` zero at 20. Events from different vCPUs are sent in occurrence order.
-Each vCPU has at most one outstanding event; the others continue executing.
+`fFlags` 0, `rc` 0; body `VMIEVENT` is 40 bytes for every kind: `u32 idCpu`
+at 0, `u32 uKind` at 4, `u64 GCPhys` at 8, `u32 cbInstr` at 16, `u32 uReg` at
+20, `u64 uOld` at 24 and `u64 uNew` at 32. Events from different vCPUs are
+sent in occurrence order. Each vCPU has at most one outstanding event; the
+others continue executing.
 
 - Breakpoint event (kind 1): `GCPhys` is the guest-physical address of the
   int3, `cbInstr` its instruction length. RIP is at the int3. A reply without
   reinjection re-executes from RIP, typically after the client restores the
   original instruction; a reply with reinjection delivers #BP to the guest
-  with its return address after the int3.
+  with its return address after the int3. `uReg`, `uOld`, `uNew` are zero.
 - Single-step event (kind 2): `GCPhys` is the guest-physical address of the
   next instruction (at RIP); `cbInstr` is zero. Steps occur at instruction
   boundaries including the first instruction of an interrupt or exception
   handler. Interrupts are not masked; an intercepted int3 encountered while
-  stepping reports the breakpoint before a step.
+  stepping reports the breakpoint before a step. `uReg`, `uOld`, `uNew` are
+  zero.
 - If RIP is not mapped by the guest's page tables (e.g. a step onto a page
   the guest has not faulted in yet), `GCPhys` is `0xffffffffffffffff`.
+- CR write event (kind 3): `uReg` is 0, 3 or 4; `uOld` is the register's
+  value, which it still holds; `uNew` is the value it will hold, i.e. the
+  `MOV CRn` source operand (32 bits outside 64-bit code; CR0 with ET set;
+  CR3 with bit 63, the PCID no-flush bit, cleared). `GCPhys` and `cbInstr` are
+  zero.
+- MSR write event (kind 4): `uReg` is the MSR index (ECX); `uOld` is the MSR's
+  current value, zero if VirtualBox does not implement the MSR (the WRMSR then
+  raises #GP as usual); `uNew` is EDX:EAX. `GCPhys` and `cbInstr` are zero.
+
+CR and MSR write events are reported before the write takes effect, with RIP
+at the `MOV CRn` or `WRMSR`. After a reply the instruction executes once,
+unchanged (a client may change its source register first with
+`VMI_MSG_REGS_WRITE`). Every write that exits is reported, unchanged values and
+unimplemented MSRs included, with these exceptions given by VT-x: a CR0 or CR4
+write that leaves the value unchanged does not exit, because VT-x exits on
+`MOV CR0`/`MOV CR4` only when a bit in the guest/host mask differs from the
+read shadow (CR3 writes always exit); `CLTS` and `LMSW` are not reported.
+With single step also set, stepping over an intercepted write reports the CR
+or MSR event first and the single-step event after the instruction. Writes
+VirtualBox emulates in ring-3 without VT-x (IEM execution) are not reported.
 
 The event's vCPU is **Parked** until a reply, but continues to serve register
 requests for itself and VM-wide pause/resume operations. It stays Parked
@@ -369,16 +411,19 @@ normally. `VMI_MSG_EVENT_REPLY` has an 8-byte `VMIEVENTREPLY` request body:
 `u32 idCpu` at 0 and `u32 fFlags` at 4. Bit 0
 `VMI_EVENT_REPLY_F_REINJECT` requests breakpoint reinjection; all other bits
 must be zero. Reply body is empty. A reply while paused succeeds and the vCPU
-continues after resume. Errors leave the vCPU Parked:
+continues after resume (a CR or MSR write executes only then). Errors leave
+the vCPU Parked:
 
 - `VERR_INVALID_PARAMETER` (-2): wrong body size, unknown flags, or
-  reinjection requested for a single-step event;
+  reinjection requested for a single-step, CR or MSR event;
 - `VERR_INVALID_CPU_ID` (-1018): unknown vCPU;
 - `VERR_INVALID_STATE` (-79): vCPU not Parked, including a second reply.
 
-Disconnect clears every intercept, stops stepping, releases all Parked vCPUs
-without reinjection, and then releases any client-owned pause. A breakpoint
-byte the client left in guest memory is not removed by the server.
+Disconnect clears every intercept (CR and MSR ones included, restoring the
+exit controls and MSR bitmap entries VirtualBox itself uses), stops stepping,
+releases all Parked vCPUs without reinjection (a pending CR or MSR write then
+executes), and then releases any client-owned pause. A breakpoint byte the
+client left in guest memory is not removed by the server.
 
 ## Disconnecting
 
@@ -392,3 +437,8 @@ client.
 - Version 2: per-vCPU breakpoint and VT-x single-step intercepts, ordered
   asynchronous events, parked vCPUs and explicit breakpoint reinjection.
   Version 1 greetings are refused with `VERR_VERSION_MISMATCH` (-11).
+- Version 2, extended before release: `VMIINTERCEPT` gains `uReg` (16
+  bytes), `VMIEVENT` gains `uReg`, `uOld`, `uNew` (40 bytes); CR0/CR3/CR4 and
+  MSR write intercepts and events on VT-x. Clients of the first version 2
+  layout must be rebuilt (the version stays 2: the first layout was never
+  released).
