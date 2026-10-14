@@ -283,8 +283,9 @@ events from its own thread. Replies execute as requests on the Parked EMT,
 so register read/write, SET/CLEAR, pause/resume and replying while paused
 cannot deadlock. A reply to an unparked vCPU or reinjection on a step
 changes nothing. A reset, power-off or destruction ends the park; a pause
-followed by resume does not. Disconnect clears every intercept and unblocks
-each Parked EMT without reinjection before the existing pause cleanup.
+followed by resume does not. Disconnect removes page restrictions, clears
+every intercept and unblocks each Parked EMT without reinjection before
+the existing pause cleanup.
 
 ## CR and MSR write intercepts
 
@@ -334,6 +335,81 @@ not exit at all.
 - AMD-V and NEM refuse these intercepts (VT-x only); writes executed by IEM
   in ring-3 (e.g. real mode emulation) and nested-guest (VMX non-root) writes
   are not reported.
+
+## Page access restrictions and emulation replies
+
+Page access SET/GET operates on guest RAM pages only (not MMIO, MMIO2, ROM or
+unassigned addresses), returning the allowed access bits; only bits 0 to 2
+are valid, and 7 (RWX) is unrestricted. SET runs as an EMT rendezvous: it changes
+the denied bits stored in `PGMPAGE`, flushes tracked shadow EPT entries and
+all vCPU EPT/IEM TLBs, then returns to the server thread. The page pool's
+tracking update disables an active 2 MiB PDE and breaks it into 4 KiB mappings.
+Allocation and recheck of large pages refuse a range containing a restriction.
+This does not install a competing PGM handler, so VirtualBox's own handlers
+keep their priority and continue working on those pages. GET takes the PGM
+lock and reads the bits. The same debugger-exclusion counter used by the
+intercepts counts every restricted page; the SET rendezvous serializes with
+debugger attach, and CLEAR (RWX) works with an attached debugger.
+
+EPT has separate watched and unwatched page-pool trees. Root allocation keys
+the view by the vCPU's page-access intercept, and each descendant inherits
+its parent's view in the pool cache (also for nested-guest EPT and split large
+pages). Thus a vCPU can share pages with other vCPUs in its view, but never
+shares writable EPT leaves across views. Setting or clearing the per-vCPU
+intercept switches its root on that EMT and flags the VMCS EPTP for re-export;
+PGM's pool tracking and invalidation continue to cover both trees. SET/CLEAR
+invalidates all vCPU EPT TLBs in the existing rendezvous, and pool flush or
+paging-mode changes rebuild roots in their respective views.
+
+Only the watched view masks write/execute permissions according to the denied
+bits. An EPT entry without read permission cannot be tracked as present by
+PGM, so watched pages with read denied (including execute-only) have no EPT
+mapping. The unwatched view keeps VirtualBox's own handlers and normal RAM
+permissions, and executes guest instructions in hardware even if IEM does not
+implement them. The VT-x EPT violation handler checks attempted access on
+watched vCPUs before PGM's existing handler path; an allowed access that EPT
+cannot map still uses IEM there. There is no temporary VM-wide permission
+lift. `PGMPhysVmiCheckAccess` stores the single attempted access, GPA and
+CPU-reported GVA in `PGMCPU::Vmi`, returning the debug-breakpoint status; EM
+parks the vCPU and sends event kind 5. The per-vCPU page access intercept is
+stored in `PGMCPU::Vmi`, not a physical handler: devices, DMA and VBoxVMI's
+own physical reads/writes are untouched. Restrictions are removed before
+disconnect releases parked vCPUs, which then retry normally.
+
+IEM has its own direct mappings and TLBs, which would bypass PGM physical
+handlers. `PGMPhysIemGCPhys2Ptr` forces restricted pages through IEM's
+bounce-buffer path; its physical mapping checks access before performing it.
+Cross-page mappings check each page in access order; opcode fetch checks
+execute access even when fetching from the slow path. The physical
+bounce-buffer path has no guest-linear address to report, so its events carry
+GVA 0. IEM TLB flushes after every SET/CLEAR prevent old direct mappings
+from bypassing these checks.
+
+The reply request validates its flags, action, length and event kind while
+the vCPU remains parked. Emulation runs synchronously on that EMT through
+`IEMExecOne` or `IEMExecOneWithPrefetchedByPC` (the 16 supplied instruction
+bytes override the int3), with every restriction ignored for that run. A
+one-by-one EMT rendezvous stops other vCPUs during emulation and any rollback.
+Emulated instruction fetches and data operands use checked bounce buffers,
+including opcode fetch. Read data is consumed in order by memory reads, zero-filling
+past the supplied length. The reply is sent only after IEM returns; on a
+failed or incomplete instruction, the saved CPU context and original RAM
+bytes (journaled before each bounce-buffer write) are restored, and the vCPU
+stays parked for another reply. With single step also enabled the EMT reports
+the step after the emulated instruction.
+
+RAM with an inactive physical handler can be emulated like other RAM. Active
+WRITE handlers have no read/execute callbacks, so read and instruction fetch
+accesses to those pages also work and retain VirtualBox's handler semantics.
+An emulated write to an active WRITE handler or any access to an active ALL
+handler is refused before the callback: `PGMPhysWrite` and `PGMPhysRead`
+invoke arbitrary callbacks that can mutate VM/device state, which restoring
+registers and RAM cannot undo if the instruction later fails. Port I/O,
+privileged and interrupt instructions are likewise refused before irreversible
+effects. REP-prefixed instructions are refused because IEM may successfully
+complete only one iteration, which would unpark midway through the instruction.
+These refusals return `VERR_NOT_SUPPORTED` with the vCPU parked. Restrictions
+still SET/GET and trap on every RAM page regardless of handler type.
 
 ## Security
 

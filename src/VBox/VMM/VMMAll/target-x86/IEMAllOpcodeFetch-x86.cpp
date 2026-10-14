@@ -38,6 +38,7 @@
 #include <VBox/vmm/cpum.h>
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/dbgf.h>
+#include <VBox/vmm/vmi.h>
 #include "IEMInternal.h"
 #include <VBox/vmm/vmcc.h>
 #include <VBox/log.h>
@@ -148,6 +149,11 @@ VBOXSTRICTRC iemOpcodeFetchPrefetch(PVMCPUCC pVCpu) RT_NOEXCEPT
     Assert(!(WalkFast.fEffective & X86_PTE_PAE_NX) || !(pVCpu->cpum.GstCtx.msrEFER & MSR_K6_EFER_NXE));
 #endif
     RTGCPHYS const GCPhys = WalkFast.GCPhys;
+
+    /* VBoxVMI page access restriction. */
+    VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrPC, VMI_PAGE_ACCESS_X);
+    if (rcStrictVmi != VINF_SUCCESS)
+        return rcStrictVmi;
 
     /*
      * Read the bytes at this address.
@@ -542,6 +548,11 @@ void iemOpcodeFetchBytesJmp(PVMCPUCC pVCpu, size_t cbDst, void *pvDst) IEM_NOEXC
             uint32_t const cbToRead = RT_MIN((uint32_t)cbDst, cbMaxRead);
             if (cbToRead > 0)
             {
+                /* VBoxVMI page access restriction (PGM gives restricted pages no mapping, so they come here). */
+                VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, pTlbe->GCPhys + (GCPtrFirst & X86_PAGE_OFFSET_MASK),
+                                                                 GCPtrFirst, VMI_PAGE_ACCESS_X);
+                if (rcStrictVmi != VINF_SUCCESS)
+                    IEM_DO_LONGJMP(pVCpu, VBOXSTRICTRC_VAL(rcStrictVmi));
                 VBOXSTRICTRC rcStrict = PGMPhysRead(pVCpu->CTX_SUFF(pVM), pTlbe->GCPhys + (GCPtrFirst & X86_PAGE_OFFSET_MASK),
                                                     pvDst, cbToRead, PGMACCESSORIGIN_IEM);
                 if (RT_LIKELY(rcStrict == VINF_SUCCESS))
@@ -687,6 +698,12 @@ VBOXSTRICTRC iemOpcodeFetchMoreBytes(PVMCPUCC pVCpu, size_t cbMin) RT_NOEXCEPT
     Assert(!(WalkFast.fEffective & X86_PTE_PAE_NX) || !(pVCpu->cpum.GstCtx.msrEFER & MSR_K6_EFER_NXE));
 
     RTGCPHYS const GCPhys = WalkFast.GCPhys;
+
+    /* VBoxVMI page access restriction. */
+    VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrNext, VMI_PAGE_ACCESS_X);
+    if (rcStrictVmi != VINF_SUCCESS)
+        return rcStrictVmi;
+
     Log5(("GCPtrNext=%RGv GCPhys=%RGp cbOpcodes=%#x\n",  GCPtrNext,  GCPhys, cbOpcode));
 
     /*

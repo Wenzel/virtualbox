@@ -34,6 +34,9 @@
 #include <VBox/vmm/mm.h>
 #include <VBox/param.h>
 #include "IOMInternal.h"
+#ifdef IN_RING3
+# include "PGMInternal.h"
+#endif
 #include <VBox/vmm/vmcc.h>
 #include <VBox/vmm/vmm.h>
 #include <VBox/vmm/selm.h>
@@ -66,6 +69,10 @@
  */
 VMMDECL(VBOXSTRICTRC) IOMIOPortRead(PVMCC pVM, PVMCPU pVCpu, RTIOPORT Port, uint32_t *pu32Value, size_t cbValue)
 {
+#ifdef IN_RING3
+    if (RT_UNLIKELY(pVCpu->pgm.s.Vmi.fEmulating))
+        return VERR_NOT_SUPPORTED; /* Device reads cannot be rolled back. */
+#endif
     STAM_COUNTER_INC(&pVM->iom.s.StatIoPortIn);
     Assert(pVCpu->iom.s.PendingIOPortWrite.cbValue == 0);
 
@@ -196,6 +203,10 @@ VMMDECL(VBOXSTRICTRC) IOMIOPortRead(PVMCC pVM, PVMCPU pVCpu, RTIOPORT Port, uint
 VMM_INT_DECL(VBOXSTRICTRC) IOMIOPortReadString(PVMCC pVM, PVMCPU pVCpu, RTIOPORT uPort,
                                                void *pvDst, uint32_t *pcTransfers, unsigned cb)
 {
+#ifdef IN_RING3
+    if (RT_UNLIKELY(pVCpu->pgm.s.Vmi.fEmulating))
+        return VERR_NOT_SUPPORTED;
+#endif
     STAM_COUNTER_INC(&pVM->iom.s.StatIoPortInS);
     Assert(pVCpu->iom.s.PendingIOPortWrite.cbValue == 0);
 
@@ -373,6 +384,10 @@ static VBOXSTRICTRC iomIOPortRing3WritePending(PVMCPU pVCpu, RTIOPORT Port, uint
  */
 VMMDECL(VBOXSTRICTRC) IOMIOPortWrite(PVMCC pVM, PVMCPU pVCpu, RTIOPORT Port, uint32_t u32Value, size_t cbValue)
 {
+#ifdef IN_RING3
+    if (RT_UNLIKELY(pVCpu->pgm.s.Vmi.fEmulating))
+        return VERR_NOT_SUPPORTED;
+#endif
     STAM_COUNTER_INC(&pVM->iom.s.StatIoPortOut);
 #ifndef IN_RING3
     Assert(pVCpu->iom.s.PendingIOPortWrite.cbValue == 0);
@@ -487,6 +502,10 @@ VMMDECL(VBOXSTRICTRC) IOMIOPortWrite(PVMCC pVM, PVMCPU pVCpu, RTIOPORT Port, uin
 VMM_INT_DECL(VBOXSTRICTRC) IOMIOPortWriteString(PVMCC pVM, PVMCPU pVCpu, RTIOPORT uPort, void const *pvSrc,
                                                 uint32_t *pcTransfers, unsigned cb)
 {
+#ifdef IN_RING3
+    if (RT_UNLIKELY(pVCpu->pgm.s.Vmi.fEmulating))
+        return VERR_NOT_SUPPORTED;
+#endif
     STAM_COUNTER_INC(&pVM->iom.s.StatIoPortOutS);
     Assert(pVCpu->iom.s.PendingIOPortWrite.cbValue == 0);
     Assert(cb == 1 || cb == 2 || cb == 4);

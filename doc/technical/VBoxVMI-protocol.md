@@ -60,6 +60,8 @@ connection. An event has `fFlags` and `rc` zero.
 | `0x000b` | `VMI_MSG_INTERCEPT_CLEAR` | `VMIINTERCEPT` | 2 |
 | `0x000c` | `VMI_MSG_EVENT_REPLY` | `VMIEVENTREPLY` | 2 |
 | `0x000d` | `VMI_MSG_EVENT` | `VMIEVENT` (server to client only) | 2 |
+| `0x000e` | `VMI_MSG_PAGE_ACCESS_SET` | `VMIPAGEACCESS` | 2 |
+| `0x000f` | `VMI_MSG_PAGE_ACCESS_GET` | `VMIPAGEACCESS` | 2 |
 
 Any other type is answered with `VERR_NOT_SUPPORTED` (-37) and an empty body;
 the connection stays up.
@@ -339,6 +341,7 @@ The kinds:
 | 2 | `VMI_INTERCEPT_SINGLESTEP` | 0 |
 | 3 | `VMI_INTERCEPT_CR_WRITE` | control register: 0, 3 or 4 |
 | 4 | `VMI_INTERCEPT_MSR_WRITE` | MSR index, any `u32` |
+| 5 | `VMI_INTERCEPT_PAGE_ACCESS` (see Page access restrictions) | 0 |
 
 Each (vCPU, kind, `uReg`) is a separate intercept. Their replies have empty
 bodies. Setting an already-set intercept or clearing an unset intercept
@@ -346,12 +349,13 @@ succeeds. These commands work while running or paused, including before
 replying to that vCPU's event. SET returns `VERR_DBGF_ALREADY_ATTACHED` (-1201)
 if the VirtualBox debugger is attached. CLEAR still works. Both return
 `VERR_INVALID_PARAMETER` (-2) for a wrong body size, a nonzero reserved field
-or a nonzero `uReg` with kinds 1 and 2, `VERR_INVALID_CPU_ID` (-1018) for an
+or a nonzero `uReg` with kinds 1, 2 and 5, `VERR_INVALID_CPU_ID` (-1018) for an
 unknown vCPU, or `VERR_NOT_SUPPORTED` (-37) for an unknown kind, a control
-register other than 0, 3 and 4, or a non-x86 VM. Single-step, CR and MSR SET
-also return -37 unless the VM runs on VT-x (single step: with the monitor trap
-flag); AMD-V and NEM stepping would alter guest-visible debug state, and they
-lack the per-vCPU exit controls CR and MSR intercepts need. A vCPU holds at
+register other than 0, 3 and 4, or a non-x86 VM. Single-step, CR, MSR and page
+access SET also return -37 unless the VM runs on VT-x (single step: with the
+monitor trap flag; page access: with nested paging); AMD-V and NEM stepping
+would alter guest-visible debug state, and they lack the per-vCPU exit controls
+CR and MSR intercepts need. A vCPU holds at
 most 64 MSR intercepts; SET of another one returns `VERR_OUT_OF_RESOURCES`
 (-80). While any intercept is set, the VirtualBox debugger cannot attach
 (`VERR_DBGF_VMI_INTERCEPTS_ACTIVE`, -1242).
@@ -391,6 +395,11 @@ others continue executing.
 - MSR write event (kind 4): `uReg` is the MSR index (ECX); `uOld` is the MSR's
   current value, zero if VirtualBox does not implement the MSR (the WRMSR then
   raises #GP as usual); `uNew` is EDX:EAX. `GCPhys` and `cbInstr` are zero.
+- Page access event (kind 5, see Page access restrictions): `GCPhys` is the
+  guest-physical address of the access (not page aligned), `uReg` the single
+  access attempted (1 read, 2 write, 4 execute), and the 8 bytes at offset 24
+  (`uOld`, C name `GCPtr`) its guest-linear address when the CPU reported one,
+  else 0. `cbInstr` and `uNew` are zero.
 
 CR and MSR write events are reported before the write takes effect, with RIP
 at the `MOV CRn` or `WRMSR`. After a reply the instruction executes once,
@@ -407,23 +416,106 @@ VirtualBox emulates in ring-3 without VT-x (IEM execution) are not reported.
 The event's vCPU is **Parked** until a reply, but continues to serve register
 requests for itself and VM-wide pause/resume operations. It stays Parked
 across pause and resume. Memory operations and requests for other vCPUs work
-normally. `VMI_MSG_EVENT_REPLY` has an 8-byte `VMIEVENTREPLY` request body:
-`u32 idCpu` at 0 and `u32 fFlags` at 4. Bit 0
-`VMI_EVENT_REPLY_F_REINJECT` requests breakpoint reinjection; all other bits
-must be zero. Reply body is empty. A reply while paused succeeds and the vCPU
-continues after resume (a CR or MSR write executes only then). Errors leave
-the vCPU Parked:
+normally. `VMI_MSG_EVENT_REPLY` has a 16-byte `VMIEVENTREPLY` request body
+followed by `cbData` bytes:
 
-- `VERR_INVALID_PARAMETER` (-2): wrong body size, unknown flags, or
-  reinjection requested for a single-step, CR or MSR event;
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 0 | 4 | `idCpu` | the Parked vCPU |
+| 4 | 4 | `fFlags` | bit 0 `VMI_EVENT_REPLY_F_REINJECT` (breakpoint reinjection), other bits 0 |
+| 8 | 4 | `uAction` | 0 `VMI_EVENT_REPLY_CONTINUE`, 1 `VMI_EVENT_REPLY_EMULATE`, 2 `VMI_EVENT_REPLY_EMULATE_READ_DATA`, 3 `VMI_EVENT_REPLY_EMULATE_INSN` |
+| 12 | 4 | `cbData` | 0 for actions 0 and 1, 1 to 256 for 2, exactly 16 for 3 |
+| 16 | `cbData` | `abData` | read data (2) or instruction bytes (3) |
+
+Continue releases the vCPU as described per event kind (a page access is
+retried). The emulation actions run the event's instruction once through
+VirtualBox's instruction emulator (IEM) with every page access restriction
+ignored, so no second page access event occurs midway:
+
+- `EMULATE` (page access events): the instruction as it is.
+- `EMULATE_READ_DATA` (page access events): the instruction's memory reads
+  return `abData` instead of guest memory, consumed in order (bytes past its
+  end read as zero), like Xen's and KVM's emulation read data.
+- `EMULATE_INSN` (breakpoint events): `abData` is executed as the instruction
+  at RIP instead of the guest's bytes (the int3); RIP then follows it.
+
+The server answers an emulation reply only after the vCPU ran the instruction
+(a pending event delivery the access belonged to is delivered instead). If
+IEM cannot run it, `rc` is IEM's failure status (e.g.
+`VERR_IEM_INSTR_NOT_IMPLEMENTED`, -5300), and the vCPU stays Parked with its
+registers and RAM unchanged, so the client can reply again. Device/MMIO
+accesses, writes to RAM with an active WRITE handler, any access to RAM with
+an active ALL handler, port I/O, privileged, interrupt and REP-prefixed
+instructions are refused with `VERR_NOT_SUPPORTED` (-37) before irreversible
+effects; read/fetch accesses to WRITE-handler RAM and all accesses to
+inactive-handler RAM can be emulated. Physical handler callbacks may change
+device or VM state that the RAM journal cannot restore on later IEM failure;
+they are never bypassed to force a successful reply. REP can otherwise finish
+only one iteration in IEM. An incomplete IEM status is reported as
+`VERR_EM_INTERPRETER` (-1148).
+An emulated instruction with single step also set reports a single-step event
+after it. Reply body is empty. A reply while paused succeeds and the vCPU
+continues after resume (a CR or MSR write executes only then; an emulation
+runs at once). Errors leave the vCPU Parked:
+
+- `VERR_INVALID_PARAMETER` (-2): body shorter than 16 bytes, `cbData` not
+  matching the body or the action, unknown action or flags, reinjection
+  requested for a single-step, CR, MSR or page access event or combined with
+  an emulation action, `EMULATE` or `EMULATE_READ_DATA` at an event other than
+  a page access, `EMULATE_INSN` at an event other than a breakpoint;
 - `VERR_INVALID_CPU_ID` (-1018): unknown vCPU;
-- `VERR_INVALID_STATE` (-79): vCPU not Parked, including a second reply.
+- `VERR_INVALID_STATE` (-79): vCPU not Parked, including a second reply;
+- an emulation failure, see above.
 
-Disconnect clears every intercept (CR and MSR ones included, restoring the
-exit controls and MSR bitmap entries VirtualBox itself uses), stops stepping,
-releases all Parked vCPUs without reinjection (a pending CR or MSR write then
-executes), and then releases any client-owned pause. A breakpoint byte the
+Disconnect removes every page access restriction, clears every intercept (CR
+and MSR ones included, restoring the exit controls and MSR bitmap entries
+VirtualBox itself uses), stops stepping, releases all Parked vCPUs without
+reinjection (a pending CR or MSR write then executes, a page access is retried
+and succeeds), and then releases any client-owned pause. A breakpoint byte the
 client left in guest memory is not removed by the server.
+
+## Page access restrictions
+
+`VMI_MSG_PAGE_ACCESS_SET` restricts the accesses of the vCPUs to one 4 KiB
+guest RAM page, for the whole VM; `VMI_MSG_PAGE_ACCESS_GET` returns a page's
+restriction. Request body `VMIPAGEACCESS` (16 bytes): `u64 GCPhys` at 0 (any
+address in the page), `u32 fAccess` at 8 and a reserved `u32` at 12 that must
+be zero. `fAccess` is the *allowed* access (as on KVM): bit 0 read
+(`VMI_PAGE_ACCESS_R`), bit 1 write (`VMI_PAGE_ACCESS_W`), bit 2 execute
+(`VMI_PAGE_ACCESS_X`); 7 removes the restriction. GET takes `fAccess` 0 and
+its reply body is a `u32`, the allowed access, 7 for an unrestricted page.
+SET's reply body is empty. Both work while running or paused, including
+before replying to an event; SET is idempotent.
+
+Only vCPU accesses are restricted: those of VT-x and VirtualBox's emulation of
+vCPU instructions (IEM). Device and DMA accesses and `VMI_MSG_PHYS_READ`/`WRITE`
+are never restricted. A denied access of a vCPU with the page access intercept
+(kind 5) raises a page access event before it takes effect, with RIP at the faulting
+instruction (the vCPU is Parked; a Continue retries the access, which faults
+again unless the restriction was lifted). A vCPU without the intercept uses
+its own EPT view without VMI restrictions, performs the access in hardware
+unreported, and keeps running; VirtualBox's own access handlers still apply.
+An instruction touching several restricted pages raises one event per retry, in
+the CPU's fault order. A page access event comes before the breakpoint event
+of an int3 and before the single-step event of the same instruction.
+
+Errors (connection kept):
+
+- `VERR_INVALID_PARAMETER` (-2): wrong body size, nonzero reserved field, bits
+  other than 0 to 2 in `fAccess`, write without read (SET), nonzero `fAccess`
+  (GET);
+- `VERR_NOT_SUPPORTED` (-37): the VM does not run on VT-x with nested paging
+  (AMD-V, NEM, non-x86), or SET of execute-only when the CPU's EPT lacks
+  execute-only support;
+- `VERR_PGM_PHYS_PAGE_RESERVED` (-1618): MMIO (special aliased MMIO
+  included), MMIO2, ROM or shadowed ROM page;
+- `VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS` (-1605): no memory at the address;
+- `VERR_DBGF_ALREADY_ATTACHED` (-1201): SET of a restriction while the
+  VirtualBox debugger is attached (removing one still works).
+
+While any restriction exists the VirtualBox debugger cannot attach
+(`VERR_DBGF_VMI_INTERCEPTS_ACTIVE`, -1242). Restricting a page inside a
+large page splits it into 4 KiB pages; every denied access costs a VM exit.
 
 ## Disconnecting
 
@@ -442,3 +534,7 @@ client.
   MSR write intercepts and events on VT-x. Clients of the first version 2
   layout must be rebuilt (the version stays 2: the first layout was never
   released).
+- Version 2, extended before release: page access restrictions
+  (`VMI_MSG_PAGE_ACCESS_SET`/`GET`), the page access intercept and event
+  (kind 5) on VT-x, and emulation replies: `VMIEVENTREPLY` gains `uAction`
+  and `cbData` (16 bytes plus data, the 8-byte form is refused with -2).

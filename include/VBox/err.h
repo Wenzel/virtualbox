@@ -379,7 +379,7 @@
 #define VERR_DBGF_BP_OWNER_CALLBACK_WRONG_STATUS (-1240)
 /** The operation was cancelled. */
 #define VERR_DBGF_CANCELLED                 (-1241)
-/** VBoxVMI owns guest intercepts (breakpoint, single-step, CR or MSR write). */
+/** VBoxVMI owns guest intercepts or page access restrictions. */
 #define VERR_DBGF_VMI_INTERCEPTS_ACTIVE      (-1242)
 /** @} */
 

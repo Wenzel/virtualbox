@@ -145,8 +145,8 @@ VMMR0DECL(int) PGMR0SharedModuleCheck(PVMCC pVM, PGVM pGVM, VMCPUID idCpu, PGMMS
                         pVM->pgm.s.cPrivatePages--;
                         PGM_PAGE_SET_STATE(pVM, pPage, PGM_PAGE_STATE_SHARED);
 
-# ifdef VBOX_STRICT /* check sum hack */
-                        pPage->s.u2Unused0 = PageDesc.u32StrictChecksum        & 3;
+# if defined(VBOX_STRICT) && !defined(VBOX_WITH_VMI) /* check sum hack; VBoxVMI keeps page access restrictions there */
+                        pPage->s.u3VmiDeniedY = PageDesc.u32StrictChecksum      & 3;
                         //pPage->s.u2Unused1 = (PageDesc.u32StrictChecksum >> 8) & 3;
 # endif
                     }

@@ -2044,6 +2044,23 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
             else
                 PGM_BTH_NAME(SyncHandlerPte)(pVM, pVCpu, pPage, GCPhysPage, fGstShwPteFlags, &PteDst);
 
+# if PGM_SHW_TYPE == PGM_TYPE_EPT
+            /*
+             * VBoxVMI page access restriction.  PGM tracks entries without read
+             * permission as not present, so execute-only and no-access pages are
+             * not mapped; the EPT violation handler emulates what is allowed.
+             */
+            uint32_t const fVmiDenied = pShwPage->fVmiUnwatched ? 0 : PGM_PAGE_GET_VMI_DENIED(pPage);
+            if (RT_UNLIKELY(fVmiDenied) && PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_RAM)
+            {
+                if (fVmiDenied & VMI_PAGE_ACCESS_R)
+                    PteDst.u = 0;
+                else
+                    PteDst.u &= ~(  (fVmiDenied & VMI_PAGE_ACCESS_W ? EPT_E_WRITE   : 0)
+                                  | (fVmiDenied & VMI_PAGE_ACCESS_X ? EPT_E_EXECUTE : 0));
+            }
+# endif
+
             /*
              * Keep user track up to date.
              */
@@ -2681,6 +2698,17 @@ static void PGM_BTH_NAME(NestedSyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPte, RTG
         /** @todo Do MMIO optimizations here too? */
         Log7Func(("mmio/all page (%R[pgmpage]) at %RGp -> 0\n", pPage, GCPhysPage));
         Pte.u = 0;
+    }
+
+    /* Preserve the guest EPT and PGM handler permissions in both views. */
+    if (!pShwPage->fVmiUnwatched && PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_RAM)
+    {
+        uint32_t const fVmiDenied = PGM_PAGE_GET_VMI_DENIED(pPage);
+        if (fVmiDenied & VMI_PAGE_ACCESS_R)
+            Pte.u = 0;
+        else
+            Pte.u &= ~(  (fVmiDenied & VMI_PAGE_ACCESS_W ? EPT_E_WRITE   : 0)
+                       | (fVmiDenied & VMI_PAGE_ACCESS_X ? EPT_E_EXECUTE : 0));
     }
 
     /* Make sure only allocated pages are mapped writable. */

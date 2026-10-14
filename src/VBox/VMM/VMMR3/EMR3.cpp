@@ -60,6 +60,7 @@
 # include "DBGFInternal.h"
 # ifdef VBOX_VMM_TARGET_X86
 #  include "HMInternal.h"
+#  include "PGMInternal.h"
 # endif
 #endif
 #include <VBox/vmm/pgm.h>
@@ -1006,6 +1007,8 @@ static VBOXSTRICTRC emR3Debug(PVM pVM, PVMCPU pVCpu, VBOXSTRICTRC rc)
                     pVCpu->hm.s.Vmi.uHitKind = 0;
                     rc = VMIR3DebugEvent(pVM, pVCpu, uKind);
                 }
+                else if (pVCpu->pgm.s.Vmi.fHitAccess)
+                    rc = VMIR3DebugEvent(pVM, pVCpu, VMI_INTERCEPT_PAGE_ACCESS); /* VT-x exit or IEM access, see PGMPhysVmiCheckAccess. */
 # endif
                 else
 #endif

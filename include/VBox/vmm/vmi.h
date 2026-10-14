@@ -104,6 +104,13 @@ RT_C_DECLS_BEGIN
 #define VMI_MSG_EVENT_REPLY         UINT16_C(0x000c)
 /** Asynchronous event, server to client, request ID zero. Body: VMIEVENT. */
 #define VMI_MSG_EVENT               UINT16_C(0x000d)
+/** Set the page access restriction of a guest RAM page.  Request body:
+ *  VMIPAGEACCESS.  Reply body: empty. */
+#define VMI_MSG_PAGE_ACCESS_SET     UINT16_C(0x000e)
+/** Get the page access restriction of a guest RAM page.  Request body:
+ *  VMIPAGEACCESS with fAccess zero.  Reply body: a uint32_t, the allowed
+ *  VMI_PAGE_ACCESS_XXX. */
+#define VMI_MSG_PAGE_ACCESS_GET     UINT16_C(0x000f)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -193,6 +200,9 @@ AssertCompileSize(VMIVCPUREQ, 8);
 /** Intercept and event kind: a WRMSR to MSR VMIINTERCEPT::uReg, reported
  *  before it takes effect (VT-x only). */
 #define VMI_INTERCEPT_MSR_WRITE     UINT32_C(4)
+/** Intercept and event kind: a vCPU access a page access restriction denies,
+ *  reported before it takes effect (VT-x only). */
+#define VMI_INTERCEPT_PAGE_ACCESS   UINT32_C(5)
 /** Maximum number of MSR write intercepts per vCPU. */
 #define VMI_MSR_INTERCEPTS_MAX      64
 /**
@@ -212,10 +222,48 @@ typedef struct VMIINTERCEPT
 } VMIINTERCEPT;
 AssertCompileSize(VMIINTERCEPT, 16);
 
+/** @name Page access bits (VMIPAGEACCESS::fAccess, VMIEVENT::uReg of page access events)
+ * @{ */
+#define VMI_PAGE_ACCESS_R           UINT32_C(1)
+#define VMI_PAGE_ACCESS_W           UINT32_C(2)
+#define VMI_PAGE_ACCESS_X           UINT32_C(4)
+/** All accesses: an unrestricted page. */
+#define VMI_PAGE_ACCESS_RWX         UINT32_C(7)
+/** @} */
+
+/**
+ * Request body of VMI_MSG_PAGE_ACCESS_SET and VMI_MSG_PAGE_ACCESS_GET.
+ */
+typedef struct VMIPAGEACCESS
+{
+    /** A guest-physical address in the 4 KiB page. */
+    uint64_t GCPhys;
+    /** The allowed accesses, VMI_PAGE_ACCESS_XXX (SET); zero (GET). */
+    uint32_t fAccess;
+    /** Reserved, zero. */
+    uint32_t u32Reserved;
+} VMIPAGEACCESS;
+AssertCompileSize(VMIPAGEACCESS, 16);
+
 /** VMIEVENTREPLY::fFlags: deliver the intercepted #BP to the guest (breakpoint events only). */
 #define VMI_EVENT_REPLY_F_REINJECT  UINT32_C(1)
+/** @name Event reply actions (VMIEVENTREPLY::uAction)
+ * @{ */
+/** Continue: re-execute (breakpoint, page access) or go on (other events). */
+#define VMI_EVENT_REPLY_CONTINUE            UINT32_C(0)
+/** Run the instruction of a page access event once, no restriction applying. */
+#define VMI_EVENT_REPLY_EMULATE             UINT32_C(1)
+/** Like VMI_EVENT_REPLY_EMULATE, the instruction's reads returning abData. */
+#define VMI_EVENT_REPLY_EMULATE_READ_DATA   UINT32_C(2)
+/** Run abData as the instruction at RIP of a breakpoint event. */
+#define VMI_EVENT_REPLY_EMULATE_INSN        UINT32_C(3)
+/** @} */
+/** Maximum VMIEVENTREPLY::cbData of VMI_EVENT_REPLY_EMULATE_READ_DATA. */
+#define VMI_EVENT_REPLY_READ_DATA_MAX       256
+/** VMIEVENTREPLY::cbData of VMI_EVENT_REPLY_EMULATE_INSN. */
+#define VMI_EVENT_REPLY_INSN_SIZE           16
 /**
- * Request body of VMI_MSG_EVENT_REPLY.
+ * Request body of VMI_MSG_EVENT_REPLY, followed by cbData bytes.
  */
 typedef struct VMIEVENTREPLY
 {
@@ -223,8 +271,12 @@ typedef struct VMIEVENTREPLY
     uint32_t idCpu;
     /** VMI_EVENT_REPLY_F_XXX, other bits zero. */
     uint32_t fFlags;
+    /** VMI_EVENT_REPLY_XXX. */
+    uint32_t uAction;
+    /** Number of data bytes following: read data or instruction bytes. */
+    uint32_t cbData;
 } VMIEVENTREPLY;
-AssertCompileSize(VMIEVENTREPLY, 8);
+AssertCompileSize(VMIEVENTREPLY, 16);
 
 /**
  * Body of VMI_MSG_EVENT.
@@ -236,17 +288,23 @@ typedef struct VMIEVENT
     /** The event, VMI_INTERCEPT_XXX. */
     uint32_t uKind;
     /** Guest-physical address of the instruction at RIP (the int3, or the next
-     *  one to step), NIL_RTGCPHYS if RIP is not mapped; zero for CR and MSR
-     *  writes. */
+     *  one to step), NIL_RTGCPHYS if RIP is not mapped; of the access for page
+     *  access events; zero for CR and MSR writes. */
     uint64_t GCPhys;
     /** Instruction length of the int3; zero for the other kinds. */
     uint32_t cbInstr;
-    /** The control register number or MSR index written; zero for breakpoints
-     *  and single steps. */
+    /** The control register number or MSR index written; the access
+     *  attempted (VMI_PAGE_ACCESS_XXX) for page access events; zero for
+     *  breakpoints and single steps. */
     uint32_t uReg;
-    /** The register's value before the write; zero for breakpoints and single steps. */
-    uint64_t uOld;
-    /** The value the write stores; zero for breakpoints and single steps. */
+    union
+    {
+        /** The register's value before the write; zero for breakpoints and single steps. */
+        uint64_t uOld;
+        /** Page access events: the guest-linear address of the access, zero if unknown. */
+        uint64_t GCPtr;
+    } RT_UNION_NM(u);
+    /** The value the write stores; zero for the other kinds. */
     uint64_t uNew;
 } VMIEVENT;
 AssertCompileSize(VMIEVENT, 40);

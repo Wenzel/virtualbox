@@ -1239,6 +1239,15 @@ VMM_INT_DECL(int)   PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPH
 #endif
 /** @} */
 
+VMM_INT_DECL(uint32_t)     PGMPhysVmiGetPageAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys);
+VMM_INT_DECL(VBOXSTRICTRC) PGMPhysVmiCheckAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys, RTGCPTR GCPtr, uint32_t fAccess);
+VMM_INT_DECL(bool)         PGMPhysVmiEmulReadData(PVMCPUCC pVCpu, void *pvBuf, size_t cbBuf);
+#ifdef IN_RING3
+VMMR3_INT_DECL(bool)       PGMPhysVmiIsEmulationRam(PVMCC pVM, RTGCPHYS GCPhys, uint32_t fAccess);
+VMMR3_INT_DECL(int)        PGMPhysVmiJournalWrite(PVMCPUCC pVCpu, RTGCPHYS GCPhys, size_t cb);
+VMMR3_INT_DECL(void)       PGMPhysVmiEndEmulation(PVMCPUCC pVCpu, bool fCommit);
+#endif
+
 /** Information returned by PGMPhysNemQueryPageInfo. */
 typedef struct PGMPHYSNEMPAGEINFO
 {

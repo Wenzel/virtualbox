@@ -107,10 +107,14 @@ typedef struct VMIR3CPU
     bool        fParked;
     /** Set by the reply: deliver the intercepted #BP to the guest. */
     bool        fReinject;
+    /** Set by an emulation reply: the instruction ran, see rcEmulated. */
+    bool        fEmulated;
     /** The event's kind, VMI_INTERCEPT_XXX. */
     uint32_t    uKind;
     /** Instruction length of the intercepted int3. */
     uint32_t    cbInstr;
+    /** IEM's status for the instruction an emulation reply ran. */
+    int32_t     rcEmulated;
 } VMIR3CPU;
 /** Pointer to the event state of one vCPU. */
 typedef VMIR3CPU *PVMIR3CPU;
@@ -323,6 +327,7 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
         case VMI_INTERCEPT_BREAKPOINT: fIsSet = pVCpu->dbgf.s.fVmiBreakpoint; break;
         case VMI_INTERCEPT_SINGLESTEP: fIsSet = pVCpu->dbgf.s.fVmiSingleStep; break;
         case VMI_INTERCEPT_CR_WRITE:   fIsSet = RT_BOOL(pVCpu->hm.s.Vmi.fCrWrites & RT_BIT_32(uReg)); break;
+        case VMI_INTERCEPT_PAGE_ACCESS: fIsSet = pVCpu->pgm.s.Vmi.fIntercept; break;
         default:
             while (iMsr < pVCpu->hm.s.Vmi.cMsrs && pVCpu->hm.s.Vmi.aMsrs[iMsr].idMsr != uReg)
                 iMsr++;
@@ -337,7 +342,8 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
         && uKind != VMI_INTERCEPT_BREAKPOINT
         && (   !HMR3IsVmxEnabled(pVM->pUVM)
             || (   uKind == VMI_INTERCEPT_SINGLESTEP
-                && !(pVM->hm.s.ForR3.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG))))
+                && !(pVM->hm.s.ForR3.vmx.Msrs.ProcCtls.n.allowed1 & VMX_PROC_CTLS_MONITOR_TRAP_FLAG))
+            || (uKind == VMI_INTERCEPT_PAGE_ACCESS && !HMR3IsNestedPagingActive(pVM->pUVM))))
         return VERR_NOT_SUPPORTED;
     switch (uKind)
     {
@@ -359,6 +365,19 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
             /* The CR0 export also decides CR3-load exiting. */
             ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR0 | HM_CHANGED_GUEST_CR4);
             break;
+        case VMI_INTERCEPT_PAGE_ACCESS:
+#ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
+        {
+            int rc = pgmVmiSwitchEptView(pVCpu, fSet);
+            if (RT_FAILURE(rc))
+                return rc;
+            ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR3);
+            break;
+        }
+#else
+            pVCpu->pgm.s.Vmi.fIntercept = fSet;
+            break;
+#endif
         default:
             if (fSet)
             {
@@ -384,6 +403,130 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
         ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
     return VINF_SUCCESS;
 }
+
+
+/**
+ * A VMI_MSG_PAGE_ACCESS_SET request for vmiR3PageAccessSetRendezvous, or the
+ * removal of every restriction (GCPhys NIL_RTGCPHYS).
+ */
+typedef struct VMIR3PAGEACCESSSET
+{
+    RTGCPHYS    GCPhys;
+    /** The allowed VMI_PAGE_ACCESS_XXX. */
+    uint32_t    fAllowed;
+    /** The result. */
+    int         rc;
+} VMIR3PAGEACCESSSET;
+
+
+/**
+ * Looks up the RAM page of a page access request, PGM lock held.
+ *
+ * @returns VBox status code: VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS without
+ *          memory, VERR_PGM_PHYS_PAGE_RESERVED for MMIO, MMIO2 and ROM.
+ */
+static int vmiR3PageAccessLookup(PVM pVM, RTGCPHYS GCPhys, PPGMPAGE *ppPage)
+{
+    *ppPage = pgmPhysGetPageSlow(pVM, GCPhys);
+    if (!*ppPage)
+        return VERR_PGM_INVALID_GC_PHYSICAL_ADDRESS;
+    if (PGM_PAGE_GET_TYPE(*ppPage) != PGMPAGETYPE_RAM)
+        return VERR_PGM_PHYS_PAGE_RESERVED;
+    return VINF_SUCCESS;
+}
+
+
+/**
+ * Changes the restriction of one page, PGM lock held, in the rendezvous.
+ *
+ * Drops the page's shadow EPT entries (breaking up a large page), so that the
+ * next access maps it with the new permissions (see SyncPageWorker).
+ *
+ * @returns true if the shadow page pool must be cleared (untracked mappings,
+ *          e.g. of the zero page).
+ */
+static bool vmiR3PageAccessChange(PVM pVM, RTGCPHYS GCPhysPage, PPGMPAGE pPage, uint32_t fDenied)
+{
+    uint32_t const fOld = PGM_PAGE_GET_VMI_DENIED(pPage);
+    PGM_PAGE_SET_VMI_DENIED(pPage, fDenied);
+    if (!fOld)
+    {
+        pVM->pgm.s.cVmiRestrictedPages++;
+        ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts); /* Debugger exclusion, like intercepts. */
+    }
+    else if (!fDenied)
+    {
+        pVM->pgm.s.cVmiRestrictedPages--;
+        ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
+    }
+    bool fFlushTlbs = false;
+    int rc = pgmPoolTrackUpdateGCPhys(pVM, GCPhysPage, pPage, true /*fFlushPTEs*/, &fFlushTlbs);
+    AssertLogRelMsg(rc == VINF_SUCCESS || rc == VINF_PGM_SYNC_CR3, ("%Rrc\n", rc));
+    return rc != VINF_SUCCESS;
+}
+
+
+/**
+ * @callback_method_impl{FNVMMEMTRENDEZVOUS,
+ *      Sets a page access restriction or removes all of them.}
+ *
+ * A rendezvous, so that no vCPU runs with stale EPT entries or IEM TLBs once
+ * the request is answered, and serialized with debugger attach.
+ */
+static DECLCALLBACK(VBOXSTRICTRC) vmiR3PageAccessSetRendezvous(PVM pVM, PVMCPU pVCpu, void *pvUser)
+{
+    VMIR3PAGEACCESSSET *pReq = (VMIR3PAGEACCESSSET *)pvUser;
+    uint32_t const fDenied = VMI_PAGE_ACCESS_RWX & ~pReq->fAllowed;
+    bool fClearPool = false;
+    bool fChanged   = false;
+    PGM_LOCK_VOID(pVM);
+    if (pReq->GCPhys != NIL_RTGCPHYS)
+    {
+        PPGMPAGE pPage;
+        pReq->rc = vmiR3PageAccessLookup(pVM, pReq->GCPhys, &pPage);
+        if (RT_SUCCESS(pReq->rc) && PGM_PAGE_GET_VMI_DENIED(pPage) != fDenied)
+        {
+            if (fDenied && pVM->dbgf.s.fAttached)
+                pReq->rc = VERR_DBGF_ALREADY_ATTACHED;
+            else
+            {
+                fClearPool = vmiR3PageAccessChange(pVM, pReq->GCPhys & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK, pPage, fDenied);
+                fChanged   = true;
+            }
+        }
+    }
+    else
+    {
+        uint32_t const cLookupEntries = RT_MIN(pVM->pgm.s.RamRangeUnion.cLookupEntries, RT_ELEMENTS(pVM->pgm.s.aRamRangeLookup));
+        for (uint32_t idxLookup = 0; idxLookup < cLookupEntries; idxLookup++)
+        {
+            uint32_t const idRamRange = PGMRAMRANGELOOKUPENTRY_GET_ID(pVM->pgm.s.aRamRangeLookup[idxLookup]);
+            AssertContinue(idRamRange < RT_ELEMENTS(pVM->pgm.s.apRamRanges));
+            PPGMRAMRANGE const pRam = pVM->pgm.s.apRamRanges[idRamRange];
+            AssertContinue(pRam);
+            for (uint32_t iPage = 0; iPage < (pRam->cb >> GUEST_PAGE_SHIFT); iPage++)
+                if (PGM_PAGE_GET_VMI_DENIED(&pRam->aPages[iPage]))
+                {
+                    fClearPool |= vmiR3PageAccessChange(pVM, pRam->GCPhys + ((RTGCPHYS)iPage << GUEST_PAGE_SHIFT),
+                                                        &pRam->aPages[iPage], 0);
+                    fChanged = true;
+                }
+        }
+        /* Restrictions of pages PGM re-initialised (e.g. mapped MMIO2 over): nothing left to undo. */
+        ASMAtomicSubU32(&pVM->dbgf.s.cVmiIntercepts, pVM->pgm.s.cVmiRestrictedPages);
+        pVM->pgm.s.cVmiRestrictedPages = 0;
+        pReq->rc = VINF_SUCCESS;
+    }
+    if (fClearPool)
+        pgmR3PoolClearAllRendezvous(pVM, pVCpu, NULL);
+    if (fChanged)
+    {
+        PGM_INVL_ALL_VCPU_TLBS(pVM);
+        IEMTlbInvalidateAllPhysicalAllCpus(pVM, pVCpu->idCpu, IEMTLBPHYSFLUSHREASON_MISC);
+    }
+    PGM_UNLOCK(pVM);
+    return VINF_SUCCESS;
+}
 #endif /* VBOX_VMM_TARGET_X86 */
 
 
@@ -399,6 +542,7 @@ static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
     vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_CR_WRITE, 4, false);
     for (uint32_t i = 0; i < pVCpu->hm.s.Vmi.cMsrs; i++) /* Clearing keeps the entries, see above. */
         vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_MSR_WRITE, pVCpu->hm.s.Vmi.aMsrs[i].idMsr, false);
+    vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_PAGE_ACCESS, 0, false);
     pVCpu->hm.s.Vmi.fSkipHit = false;
     pThis->paCpus[pVCpu->idCpu].fParked = false;
 #else
@@ -409,10 +553,21 @@ static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
 
 
 /**
- * Removes intercepts, releases parked vCPUs, then undoes the client's pause.
+ * Removes page access restrictions and intercepts, releases parked vCPUs (a
+ * page access retried then succeeds), then undoes the client's pause.
  */
 static void vmiR3CleanupSession(PVMIR3 pThis)
 {
+#ifdef VBOX_VMM_TARGET_X86
+    PVM const pVM = pThis->pUVM->pVM;
+    if (pVM->pgm.s.cVmiRestrictedPages && VMR3GetStateU(pThis->pUVM) < VMSTATE_POWERING_OFF)
+    {
+        VMIR3PAGEACCESSSET Req = { NIL_RTGCPHYS, VMI_PAGE_ACCESS_RWX, VINF_SUCCESS };
+        int rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE, vmiR3PageAccessSetRendezvous, &Req);
+        if (RT_FAILURE(rc))
+            LogRel(("VMI: Cannot remove the page access restrictions: %Rrc\n", rc));
+    }
+#endif
     for (uint32_t idCpu = 0; idCpu < pThis->pUVM->cCpus; idCpu++)
     {
         int rc = VMR3ReqCallWaitU(pThis->pUVM, idCpu, (PFNRT)vmiR3ClearOnEmt, 2, pThis->pUVM->pVM, pThis);
@@ -1280,19 +1435,172 @@ static bool vmiR3HandleRegs(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
                                 &Regs, RT_SUCCESS(rc) && !fWrite ? sizeof(Regs) : 0));
 }
 
+
+/**
+ * Runs the instruction of an emulation reply on the parked EMT, once, with
+ * every page access restriction ignored.
+ *
+ * On failure the registers and journaled RAM writes are restored.
+ *
+ * @returns VBox status code, the failure to report if IEM could not run it.
+ * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
+ * @param   uAction     VMI_EVENT_REPLY_EMULATE, _EMULATE_READ_DATA or _EMULATE_INSN.
+ * @param   pbData      The read data or instruction bytes.
+ * @param   cbData      Their size (validated).
+ * @param   prcEmulated Where to store IEM's status on success.
+ */
+static int vmiR3Emulate(PVMCPU pVCpu, uint32_t uAction, uint8_t const *pbData, uint32_t cbData, int32_t *prcEmulated)
+{
+    Assert(pVCpu->pgm.s.Vmi.pvJournal == NULL);
+    CPUM_IMPORT_EXTRN_RET(pVCpu, CPUMCTX_EXTRN_ALL);
+    /* DIS reads the guest opcode before IEM's checked bounce buffers are active. */
+    RTGCPTR const GCPtrRip = CPUMGetGuestFlatPC(pVCpu);
+    RTGCPHYS GCPhysRip;
+    if (   RT_FAILURE(PGMPhysGCPtr2GCPhys(pVCpu, GCPtrRip, &GCPhysRip))
+        || !PGMPhysVmiIsEmulationRam(pVCpu->CTX_SUFF(pVM), GCPhysRip, VMI_PAGE_ACCESS_X))
+        return VERR_NOT_SUPPORTED;
+    if (   uAction != VMI_EVENT_REPLY_EMULATE_INSN
+        && (GCPtrRip & GUEST_PAGE_OFFSET_MASK) > GUEST_PAGE_SIZE - 15 /* longest x86 instruction */)
+    {
+        RTGCPHYS GCPhysNext;
+        if (   RT_FAILURE(PGMPhysGCPtr2GCPhys(pVCpu, (GCPtrRip | GUEST_PAGE_OFFSET_MASK) + 1, &GCPhysNext))
+            || !PGMPhysVmiIsEmulationRam(pVCpu->CTX_SUFF(pVM), GCPhysNext, VMI_PAGE_ACCESS_X))
+            return VERR_NOT_SUPPORTED;
+    }
+    /*
+     * Privileged, port-I/O and interrupt instructions can change device or
+     * VM state that a RAM journal cannot restore after an IEM failure.
+     * IEM can stop a REP instruction after one iteration, so refuse it
+     * rather than unpark halfway through the instruction.
+     */
+    DISSTATE Dis;
+    unsigned cbInstr = 0;
+    int rcDis;
+    if (uAction == VMI_EVENT_REPLY_EMULATE_INSN)
+        rcDis = DISInstrWithPrefetchedBytes((RTUINTPTR)CPUMGetGuestFlatPC(pVCpu), CPUMGetGuestDisMode(pVCpu),
+                                           DISOPTYPE_ALL, pbData, cbData, NULL, NULL, &Dis, &cbInstr);
+    else
+        rcDis = EMInterpretDisasCurrent(pVCpu, &Dis, &cbInstr);
+    if (   RT_FAILURE(rcDis)
+        || !Dis.pCurInstr
+        || (Dis.pCurInstr->fOpType & (  DISOPTYPE_DANGEROUS | DISOPTYPE_PORTIO | DISOPTYPE_PRIVILEGED
+                                    | DISOPTYPE_INTERRUPT | DISOPTYPE_INHIBIT_IRQS))
+        || (Dis.x86.fPrefix & (DISPREFIX_REP | DISPREFIX_REPNE)))
+        return VERR_NOT_SUPPORTED;
+    PCPUMCTX pCtxSaved = (PCPUMCTX)RTMemTmpAlloc(sizeof(*pCtxSaved));
+    AssertReturn(pCtxSaved, VERR_NO_TMP_MEMORY);
+    *pCtxSaved = pVCpu->cpum.GstCtx;
+
+    pVCpu->pgm.s.Vmi.fEmulating = true;
+    if (uAction == VMI_EVENT_REPLY_EMULATE_READ_DATA)
+    {
+        pVCpu->pgm.s.Vmi.pbReadData  = pbData;
+        pVCpu->pgm.s.Vmi.offReadData = 0;
+        pVCpu->pgm.s.Vmi.cbReadData  = (uint16_t)cbData;
+    }
+    IEMTlbInvalidateAll(pVCpu); /* Every page must be checked and bounce buffered. */
+    VBOXSTRICTRC rcStrict;
+    if (uAction == VMI_EVENT_REPLY_EMULATE_INSN)
+        rcStrict = IEMExecOneWithPrefetchedByPC(pVCpu, CPUMGetGuestFlatPC(pVCpu), pbData, cbData);
+    else if (TRPMHasTrap(pVCpu))
+        rcStrict = IEMInjectTrpmEvent(pVCpu); /* The access delivered an interrupt or exception. */
+    else
+        rcStrict = IEMExecOne(pVCpu);
+    pVCpu->pgm.s.Vmi.fEmulating = false;
+    pVCpu->pgm.s.Vmi.cbReadData = 0;
+    pVCpu->pgm.s.Vmi.pbReadData = NULL;
+    bool const fCompleted = rcStrict == VINF_SUCCESS || rcStrict == VINF_EM_RESCHEDULE;
+    PGMPhysVmiEndEmulation(pVCpu, fCompleted);
+    IEMTlbInvalidateAll(pVCpu);
+
+    int rc = VINF_SUCCESS;
+    if (!fCompleted)
+    {
+        int const rcFailure = RT_FAILURE(VBOXSTRICTRC_VAL(rcStrict)) ? VBOXSTRICTRC_VAL(rcStrict) : VERR_EM_INTERPRETER;
+        LogRel(("VMI: Cannot emulate the instruction of vCPU %u at %RGv: %Rrc\n",
+                pVCpu->idCpu, CPUMGetGuestFlatPC(pVCpu), rcFailure));
+        pVCpu->cpum.GstCtx = *pCtxSaved;
+        HMNotifyGuestCtxChanged(pVCpu);
+        rc = rcFailure;
+    }
+    else
+        *prcEmulated = VBOXSTRICTRC_VAL(rcStrict);
+    RTMemTmpFree(pCtxSaved);
+    return rc;
+}
+
+/** Data for emulation while the other EMTs wait at the rendezvous. */
+typedef struct VMIR3EMULATE
+{
+    VMCPUID            idCpu;
+    uint32_t           uAction;
+    uint8_t const     *pbData;
+    uint32_t           cbData;
+    int32_t           *prcEmulated;
+    int                rc;
+} VMIR3EMULATE;
+
+
+static DECLCALLBACK(VBOXSTRICTRC) vmiR3EmulateRendezvous(PVM pVM, PVMCPU pVCpu, void *pvUser)
+{
+    RT_NOREF(pVM);
+    VMIR3EMULATE *pReq = (VMIR3EMULATE *)pvUser;
+    if (pVCpu->idCpu == pReq->idCpu)
+        pReq->rc = vmiR3Emulate(pVCpu, pReq->uAction, pReq->pbData, pReq->cbData, pReq->prcEmulated);
+    return VINF_SUCCESS;
+}
+
 #endif /* VBOX_VMM_TARGET_X86 */
 
-/** Accepts an event reply on the parked vCPU's EMT. */
-static DECLCALLBACK(int) vmiR3ReplyOnEmt(PVM pVM, PVMIR3 pThis, uint32_t fFlags)
+/**
+ * Accepts an event reply on the parked vCPU's EMT; an emulation reply runs the
+ * instruction here, so that its failure leaves the vCPU parked.
+ *
+ * @returns VBox status code for the reply.
+ * @param   pVM     The cross context VM structure.
+ * @param   pThis   The VBoxVMI instance.
+ * @param   pReq    The reply, validated but for the event it applies to.
+ * @param   pbData  The bytes following it.
+ */
+static DECLCALLBACK(int) vmiR3ReplyOnEmt(PVM pVM, PVMIR3 pThis, VMIEVENTREPLY const *pReq, uint8_t const *pbData)
 {
     PVMCPU pVCpu = VMMGetCpu(pVM);
-    uint32_t const idCpu = pVCpu->idCpu;
-    if (!pThis->paCpus[idCpu].fParked)
+    PVMIR3CPU const pCpu = &pThis->paCpus[pVCpu->idCpu];
+    if (!pCpu->fParked)
         return VERR_INVALID_STATE;
-    if ((fFlags & VMI_EVENT_REPLY_F_REINJECT) && pThis->paCpus[idCpu].uKind != VMI_INTERCEPT_BREAKPOINT)
-        return VERR_INVALID_PARAMETER;
-    pThis->paCpus[idCpu].fReinject = RT_BOOL(fFlags & VMI_EVENT_REPLY_F_REINJECT);
-    pThis->paCpus[idCpu].fParked = false;
+    switch (pReq->uAction)
+    {
+        case VMI_EVENT_REPLY_CONTINUE:
+            if ((pReq->fFlags & VMI_EVENT_REPLY_F_REINJECT) && pCpu->uKind != VMI_INTERCEPT_BREAKPOINT)
+                return VERR_INVALID_PARAMETER;
+            break;
+        case VMI_EVENT_REPLY_EMULATE:
+        case VMI_EVENT_REPLY_EMULATE_READ_DATA:
+            if (pCpu->uKind != VMI_INTERCEPT_PAGE_ACCESS)
+                return VERR_INVALID_PARAMETER;
+            break;
+        default:
+            if (pCpu->uKind != VMI_INTERCEPT_BREAKPOINT)
+                return VERR_INVALID_PARAMETER;
+            break;
+    }
+    if (pReq->uAction != VMI_EVENT_REPLY_CONTINUE)
+    {
+#ifdef VBOX_VMM_TARGET_X86
+        VMIR3EMULATE Emulate = { pVCpu->idCpu, pReq->uAction, pbData, pReq->cbData, &pCpu->rcEmulated, VINF_SUCCESS };
+        int rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONE_BY_ONE, vmiR3EmulateRendezvous, &Emulate);
+        if (RT_SUCCESS(rc))
+            rc = Emulate.rc;
+        if (RT_FAILURE(rc))
+            return rc;
+        pCpu->fEmulated = true;
+#else
+        RT_NOREF(pbData);
+        return VERR_NOT_SUPPORTED;
+#endif
+    }
+    pCpu->fReinject = RT_BOOL(pReq->fFlags & VMI_EVENT_REPLY_F_REINJECT);
+    pCpu->fParked = false;
     return VINF_SUCCESS;
 }
 
@@ -1322,19 +1630,27 @@ static void vmiR3Wakeup(PVMIR3 pThis)
  *
  * @returns Strict VBox status code for EM: VINF_EM_RESCHEDULE or
  *          VINF_EM_SUSPEND to continue, VINF_EM_DBG_STEPPED after a CR or MSR
- *          write executed while single stepping, or the status ending the park
- *          (VINF_EM_OFF, VINF_EM_RESET, VINF_EM_TERMINATE, failure).
+ *          write or an emulation reply executed while single stepping, or the
+ *          status ending the park (VINF_EM_OFF, VINF_EM_RESET,
+ *          VINF_EM_TERMINATE, failure).
  * @param   pVM     The cross context VM structure.
  * @param   pVCpu   The cross context virtual CPU structure of the calling EMT.
  * @param   uKind   The event kind, VMI_INTERCEPT_XXX.  For CR and MSR writes the
  *                  VM-exit handler left the register and new value in
- *                  HMCPU::Vmi; the write executes here after the reply.
+ *                  HMCPU::Vmi; the write executes here after the reply.  For
+ *                  page accesses PGMPhysVmiCheckAccess left the access in
+ *                  PGMCPU::Vmi; the instruction re-executes after the reply,
+ *                  unless an emulation reply ran it.
  */
 VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKind)
 {
+#ifdef VBOX_VMM_TARGET_X86
+    uint8_t const fHitAccess = pVCpu->pgm.s.Vmi.fHitAccess;
+    pVCpu->pgm.s.Vmi.fHitAccess = 0;
+#endif
     PVMIR3 pThis = (PVMIR3)pVM->pUVM->vm.s.pvVMI;
     if (!pThis || !pThis->fHandshaked)
-        return VINF_EM_RESCHEDULE; /* A pending write re-executes, its intercept is cleared already. */
+        return VINF_EM_RESCHEDULE; /* A pending write or access re-executes, its intercept is cleared already. */
 
     VMIEVENT Event;
     RT_ZERO(Event);
@@ -1354,6 +1670,14 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
                        : Event.uReg == 3 ? CPUMGetGuestCR3(pVCpu) : CPUMGetGuestCR4(pVCpu);
 #endif
     }
+#ifdef VBOX_VMM_TARGET_X86
+    else if (uKind == VMI_INTERCEPT_PAGE_ACCESS)
+    {
+        Event.GCPhys = pVCpu->pgm.s.Vmi.GCPhysHit;
+        Event.uReg   = fHitAccess;
+        Event.GCPtr  = pVCpu->pgm.s.Vmi.GCPtrHit;
+    }
+#endif
     else
     {
         /* An unmapped RIP (a step onto a page not faulted in yet) is reported, not fatal to EM. */
@@ -1374,6 +1698,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
     pThis->paCpus[idCpu].uKind = uKind;
     pThis->paCpus[idCpu].cbInstr = Event.cbInstr;
     pThis->paCpus[idCpu].fReinject = false;
+    pThis->paCpus[idCpu].fEmulated = false;
     pThis->paCpus[idCpu].fParked = true;
     RTSemFastMutexRequest(pThis->hMtxEvents);
     Assert(pThis->cEvents < pVM->cCpus);
@@ -1422,6 +1747,17 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
     }
 
 #ifdef VBOX_VMM_TARGET_X86
+    if (pThis->paCpus[idCpu].fEmulated)
+    {
+        /* An emulation reply ran the instruction on this EMT already (vmiR3ReplyOnEmt), also while paused. */
+        VBOXSTRICTRC const rcStrict = pThis->paCpus[idCpu].rcEmulated;
+        if (   rcStrict >= VINF_EM_FIRST
+            && rcStrict <= VINF_EM_LAST
+            && rcStrict != VINF_EM_RESCHEDULE /* == VINF_IEM_RAISED_XCPT, the guest got its exception */)
+            return rcStrict;
+        if (pVCpu->dbgf.s.fVmiSingleStep)
+            return VINF_EM_DBG_STEPPED;
+    }
 
     if (fWrite)
     {
@@ -1472,11 +1808,13 @@ static bool vmiR3HandleIntercept(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
             rc = VERR_INVALID_PARAMETER;
         else if (Req.idCpu >= pThis->pUVM->cCpus)
             rc = VERR_INVALID_CPU_ID;
-        else if (   (Req.uKind == VMI_INTERCEPT_BREAKPOINT || Req.uKind == VMI_INTERCEPT_SINGLESTEP)
+        else if (   (   Req.uKind == VMI_INTERCEPT_BREAKPOINT
+                     || Req.uKind == VMI_INTERCEPT_SINGLESTEP
+                     || Req.uKind == VMI_INTERCEPT_PAGE_ACCESS)
                  && Req.uReg)
             rc = VERR_INVALID_PARAMETER;
         else if (   Req.uKind < VMI_INTERCEPT_BREAKPOINT
-                 || Req.uKind > VMI_INTERCEPT_MSR_WRITE
+                 || Req.uKind > VMI_INTERCEPT_PAGE_ACCESS
                  || (Req.uKind == VMI_INTERCEPT_CR_WRITE && Req.uReg != 0 && Req.uReg != 3 && Req.uReg != 4))
             rc = VERR_NOT_SUPPORTED;
 #ifdef VBOX_VMM_TARGET_X86
@@ -1492,22 +1830,83 @@ static bool vmiR3HandleIntercept(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
 }
 
 
-/** Validates the reply before releasing its parked EMT. */
-static bool vmiR3HandleEventReply(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+/**
+ * Sets (in an EMT rendezvous) or gets the page access restriction of a page.
+ */
+static bool vmiR3HandlePageAccess(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
 {
-    VMIEVENTREPLY Req;
+    bool const    fSet = pHdr->uType == VMI_MSG_PAGE_ACCESS_SET;
+    uint32_t      fAllowed = VMI_PAGE_ACCESS_RWX;
+    VMIPAGEACCESS Req;
     int rc = cbBody == sizeof(Req) ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
     if (RT_SUCCESS(rc))
     {
         memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
-        if (Req.fFlags & ~VMI_EVENT_REPLY_F_REINJECT)
+        if (   Req.u32Reserved
+            || (Req.fAccess & ~VMI_PAGE_ACCESS_RWX)
+            || (fSet ? (Req.fAccess & (VMI_PAGE_ACCESS_R | VMI_PAGE_ACCESS_W)) == VMI_PAGE_ACCESS_W : Req.fAccess != 0))
+            rc = VERR_INVALID_PARAMETER;
+#ifdef VBOX_VMM_TARGET_X86
+        else if (!HMR3IsVmxEnabled(pThis->pUVM) || !HMR3IsNestedPagingActive(pThis->pUVM))
+            rc = VERR_NOT_SUPPORTED; /* The restrictions live in the EPT entries. */
+        else if (   fSet
+                 && Req.fAccess == VMI_PAGE_ACCESS_X
+                 && !(pThis->pUVM->pVM->hm.s.ForR3.vmx.Msrs.u64EptVpidCaps & VMX_BF_EPT_VPID_CAP_EXEC_ONLY_MASK))
+            rc = VERR_NOT_SUPPORTED;
+        else if (fSet)
+        {
+            VMIR3PAGEACCESSSET Set = { Req.GCPhys, Req.fAccess, VINF_SUCCESS };
+            rc = VMMR3EmtRendezvous(pThis->pUVM->pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE, vmiR3PageAccessSetRendezvous, &Set);
+            if (RT_SUCCESS(rc))
+                rc = Set.rc;
+        }
+        else
+        {
+            PVM const pVM = pThis->pUVM->pVM;
+            PGM_LOCK_VOID(pVM);
+            PPGMPAGE pPage;
+            rc = vmiR3PageAccessLookup(pVM, Req.GCPhys, &pPage);
+            if (RT_SUCCESS(rc))
+                fAllowed = VMI_PAGE_ACCESS_RWX & ~PGM_PAGE_GET_VMI_DENIED(pPage);
+            PGM_UNLOCK(pVM);
+        }
+#else
+        else
+            rc = VERR_NOT_SUPPORTED;
+#endif
+    }
+    if (RT_SUCCESS(rc))
+        rc = VINF_SUCCESS;
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc,
+                                &fAllowed, RT_SUCCESS(rc) && !fSet ? sizeof(fAllowed) : 0));
+}
+
+
+/** Validates the reply before handing it to its parked EMT. */
+static bool vmiR3HandleEventReply(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    VMIEVENTREPLY Req;
+    int rc = cbBody >= sizeof(Req) ? VINF_SUCCESS : VERR_INVALID_PARAMETER;
+    if (RT_SUCCESS(rc))
+    {
+        uint8_t const *pbData = (uint8_t const *)pHdr + sizeof(*pHdr) + sizeof(Req);
+        memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
+        if (   (Req.fFlags & ~VMI_EVENT_REPLY_F_REINJECT)
+            || Req.cbData != cbBody - sizeof(Req)
+            || Req.uAction > VMI_EVENT_REPLY_EMULATE_INSN
+            || ((Req.fFlags & VMI_EVENT_REPLY_F_REINJECT) && Req.uAction != VMI_EVENT_REPLY_CONTINUE)
+            || (  Req.uAction <= VMI_EVENT_REPLY_EMULATE           ? Req.cbData != 0
+                : Req.uAction == VMI_EVENT_REPLY_EMULATE_READ_DATA ? Req.cbData - 1 >= VMI_EVENT_REPLY_READ_DATA_MAX
+                :                                                    Req.cbData != VMI_EVENT_REPLY_INSN_SIZE))
             rc = VERR_INVALID_PARAMETER;
         else if (Req.idCpu >= pThis->pUVM->cCpus)
             rc = VERR_INVALID_CPU_ID;
         else
-            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3ReplyOnEmt, 3,
-                                  pThis->pUVM->pVM, pThis, Req.fFlags);
+            rc = VMR3ReqCallWaitU(pThis->pUVM, Req.idCpu, (PFNRT)vmiR3ReplyOnEmt, 4,
+                                  pThis->pUVM->pVM, pThis, &Req, pbData);
     }
+    if (RT_SUCCESS(rc))
+        rc = VINF_SUCCESS;
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, NULL, 0));
 }
 
@@ -1559,6 +1958,9 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
             return vmiR3HandleIntercept(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_EVENT_REPLY:
             return vmiR3HandleEventReply(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_PAGE_ACCESS_SET:
+        case VMI_MSG_PAGE_ACCESS_GET:
+            return vmiR3HandlePageAccess(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_PHYS_READ:
             return vmiR3HandlePhysRead(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_PHYS_WRITE:

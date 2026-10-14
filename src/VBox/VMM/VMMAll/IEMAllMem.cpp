@@ -38,7 +38,9 @@
 #include <VBox/vmm/cpum.h>
 #include <VBox/vmm/pgm.h>
 #include <VBox/vmm/dbgf.h>
+#include <VBox/vmm/vmi.h>
 #include "IEMInternal.h"
+#include "PGMInternal.h"
 #include <VBox/vmm/vmcc.h>
 #include <VBox/log.h>
 #include <VBox/err.h>
@@ -158,6 +160,20 @@ static VBOXSTRICTRC iemMemBounceBufferCommitAndUnmap(PVMCPUCC pVCpu, unsigned iM
         uint16_t const  cbFirst  = ICORE(pVCpu).aMemBbMappings[iMemMap].cbFirst;
         uint16_t const  cbSecond = ICORE(pVCpu).aMemBbMappings[iMemMap].cbSecond;
         uint8_t const  *pbBuf    = &ICORE(pVCpu).aBounceBuffers[iMemMap].ab[0];
+#ifdef IN_RING3
+        if (pVCpu->pgm.s.Vmi.fEmulating)
+        {
+            int rc = PGMPhysVmiJournalWrite(pVCpu, ICORE(pVCpu).aMemBbMappings[iMemMap].GCPhysFirst, cbFirst);
+            if (RT_FAILURE(rc))
+                return rc;
+            if (cbSecond)
+            {
+                rc = PGMPhysVmiJournalWrite(pVCpu, ICORE(pVCpu).aMemBbMappings[iMemMap].GCPhysSecond, cbSecond);
+                if (RT_FAILURE(rc))
+                    return rc;
+            }
+        }
+#endif
         if (!(ICORE(pVCpu).fExec & IEM_F_BYPASS_HANDLERS))
         {
             /*
@@ -367,6 +383,18 @@ VBOXSTRICTRC iemMemBounceBufferMapCrossPage(PVMCPUCC pVCpu, int iMemMap, void **
     Assert((GCPhysSecond & GUEST_PAGE_OFFSET_MASK) == 0);
     GCPhysSecond &= ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK; /** @todo why? */
 
+    /*
+     * VBoxVMI page access restrictions, in the order the CPU faults.
+     */
+    AssertCompile(IEM_ACCESS_TYPE_READ == VMI_PAGE_ACCESS_R && IEM_ACCESS_TYPE_WRITE == VMI_PAGE_ACCESS_W);
+    AssertCompile(IEM_ACCESS_TYPE_EXEC == VMI_PAGE_ACCESS_X);
+    rcStrict = PGMPhysVmiCheckAccess(pVCpu, GCPhysFirst, GCPtrFirst, fAccess & IEM_ACCESS_TYPE_MASK);
+    if (rcStrict == VINF_SUCCESS)
+        rcStrict = PGMPhysVmiCheckAccess(pVCpu, GCPhysSecond, (GCPtrFirst + (cbMem - 1)) & ~(RTGCPTR)GUEST_PAGE_OFFSET_MASK,
+                                         fAccess & IEM_ACCESS_TYPE_MASK);
+    if (rcStrict != VINF_SUCCESS)
+        return rcStrict;
+
     PVMCC pVM = pVCpu->CTX_SUFF(pVM);
 
     /*
@@ -479,6 +507,8 @@ VBOXSTRICTRC iemMemBounceBufferMapCrossPage(PVMCPUCC pVCpu, int iMemMap, void **
 #if !defined(IN_RING0) || !defined(__GNUC__) /** @todo fix the macro... -Winvalid-offsetof issue. */
     AssertCompileMemberAlignment(VMCPUCC, IEM_CORE_MEMBER.aBounceBuffers, 64);
 #endif
+    if (fAccess & IEM_ACCESS_TYPE_READ)
+        PGMPhysVmiEmulReadData(pVCpu, pbBuf, cbMem);
 
     /*
      * Commit the bounce buffer entry.
@@ -518,6 +548,13 @@ VBOXSTRICTRC iemMemBounceBufferMapPhys(PVMCPUCC pVCpu, unsigned iMemMap, void **
         return rcMap;
     }
     ICORE(pVCpu).cPotentialExits++;
+
+    /*
+     * VBoxVMI page access restriction: PGM sends restricted pages here.
+     */
+    VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhysFirst, 0 /*GCPtr*/, fAccess & IEM_ACCESS_TYPE_MASK);
+    if (rcStrictVmi != VINF_SUCCESS)
+        return rcStrictVmi;
 
     /*
      * Read in the current memory content if it's a read, execute or partial
@@ -567,6 +604,8 @@ VBOXSTRICTRC iemMemBounceBufferMapPhys(PVMCPUCC pVCpu, unsigned iMemMap, void **
     if (cbMem < sizeof(ICORE(pVCpu).aBounceBuffers[iMemMap].ab))
         memset(pbBuf + cbMem, 0xaa, sizeof(ICORE(pVCpu).aBounceBuffers[iMemMap].ab) - cbMem);
 #endif
+    if (fAccess & IEM_ACCESS_TYPE_READ)
+        PGMPhysVmiEmulReadData(pVCpu, pbBuf, cbMem);
 
     /*
      * Commit the bounce buffer entry.

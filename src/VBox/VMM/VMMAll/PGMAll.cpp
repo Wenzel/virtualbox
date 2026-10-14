@@ -46,6 +46,7 @@
 #include <VBox/vmm/em.h>
 #include <VBox/vmm/hm.h>
 #include <VBox/vmm/hm_vmx.h>
+#include <VBox/vmm/vmi.h>
 #include "PGMInternal.h"
 #include <VBox/vmm/vmcc.h>
 #include "PGMInline.h"
@@ -2355,6 +2356,56 @@ VMMDECL(RTHCPHYS) PGMGetHyperCR3(PVMCPU pVCpu)
     return NIL_RTHCPHYS;
 # endif
 }
+
+# if defined(IN_RING3) && !defined(VBOX_WITH_ONLY_PGM_NEM_MODE)
+/**
+ * Selects an EPT pool tree for this EMT without changing any other vCPU's EPT.
+ * The pool keys root and descendants by view; the old root can remain cached.
+ */
+int pgmVmiSwitchEptView(PVMCPU pVCpu, bool fIntercept)
+{
+    PVM pVM = pVCpu->CTX_SUFF(pVM);
+    PGM_LOCK_VOID(pVM);
+    if (pVCpu->pgm.s.Vmi.fIntercept == fIntercept)
+    {
+        PGM_UNLOCK(pVM);
+        return VINF_SUCCESS;
+    }
+
+    PPGMPOOLPAGE pOldRoot = pVCpu->pgm.s.pShwPageCR3R3;
+    pVCpu->pgm.s.Vmi.fIntercept = fIntercept;
+    if (pVCpu->pgm.s.enmShadowMode == PGMMODE_EPT && pOldRoot)
+    {
+        RTGCPHYS GCPhysRoot = RT_BIT_64(63);
+        PGMPOOLKIND enmKind = PGMPOOLKIND_ROOT_NESTED;
+#  ifdef VBOX_WITH_NESTED_HWVIRT_VMX_EPT
+        if (pVCpu->pgm.s.enmGuestSlatMode == PGMSLAT_EPT)
+        {
+            GCPhysRoot = pVCpu->pgm.s.uEptPtr & EPT_EPTP_PG_MASK;
+            enmKind = PGMPOOLKIND_EPT_PML4_FOR_EPT_PML4;
+        }
+#  endif
+        PPGMPOOL pPool = pVM->pgm.s.pPoolR3;
+        PPGMPOOLPAGE pNewRoot;
+        int rc = pgmPoolAlloc(pVM, GCPhysRoot, enmKind, PGMPOOLACCESS_DONTCARE, PGM_A20_IS_ENABLED(pVCpu),
+                              NIL_PGMPOOL_IDX, UINT32_MAX, true /* fLockPage */, &pNewRoot);
+        if (RT_FAILURE(rc))
+        {
+            pVCpu->pgm.s.Vmi.fIntercept = !fIntercept;
+            PGM_UNLOCK(pVM);
+            return rc;
+        }
+        Assert(pOldRoot != pNewRoot);
+        Assert(pOldRoot->fVmiUnwatched == fIntercept && pNewRoot->fVmiUnwatched == !fIntercept);
+        pVCpu->pgm.s.pShwPageCR3R3 = pgmPoolConvertPageToR3(pPool, pNewRoot);
+        pVCpu->pgm.s.pShwPageCR3R0 = pgmPoolConvertPageToR0(pPool, pNewRoot);
+        pgmPoolUnlockPage(pPool, pOldRoot);
+        pgmPoolFreeByPage(pPool, pOldRoot, NIL_PGMPOOL_IDX, UINT32_MAX);
+    }
+    PGM_UNLOCK(pVM);
+    return VINF_SUCCESS;
+}
+# endif
 
 
 /**

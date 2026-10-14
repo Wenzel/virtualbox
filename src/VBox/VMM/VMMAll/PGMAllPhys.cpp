@@ -41,6 +41,7 @@
 #include <VBox/vmm/iom.h>
 #include <VBox/vmm/em.h>
 #include <VBox/vmm/nem.h>
+#include <VBox/vmm/vmi.h>
 #include "PGMInternal.h"
 #include <VBox/vmm/vmcc.h>
 
@@ -54,6 +55,7 @@
 #include <VBox/log.h>
 #ifdef IN_RING3
 # include <iprt/thread.h>
+# include <iprt/mem.h>
 # ifdef VBOX_WITH_ONLY_PGM_NEM_MODE
 #  include <iprt/zero.h>
 # endif
@@ -2517,7 +2519,8 @@ int pgmPhysAllocLargePage(PVMCC pVM, RTGCPHYS GCPhys)
                 PPGMPAGE pSubPage = pgmPhysGetPage(pVM, GCPhys);
                 if (   pSubPage
                     && PGM_PAGE_GET_TYPE(pSubPage)  == PGMPAGETYPE_RAM      /* Anything other than ram implies monitoring. */
-                    && PGM_PAGE_GET_STATE(pSubPage) == PGM_PAGE_STATE_ZERO) /* Allocated, monitored or shared means we can't use a large page here */
+                    && PGM_PAGE_GET_STATE(pSubPage) == PGM_PAGE_STATE_ZERO  /* Allocated, monitored or shared means we can't use a large page here */
+                    && !PGM_PAGE_GET_VMI_DENIED(pSubPage))                  /* VBoxVMI restrictions need 4K EPT entries. */
                 {
                     Assert(PGM_PAGE_GET_PDE_TYPE(pSubPage) == PGM_PAGE_PDE_TYPE_DONTCARE);
                     GCPhys += GUEST_PAGE_SIZE;
@@ -2585,7 +2588,8 @@ int pgmPhysRecheckLargePage(PVMCC pVM, RTGCPHYS GCPhys, PPGMPAGE pLargePage)
     Assert(PGM_PAGE_GET_PDE_TYPE(pLargePage) == PGM_PAGE_PDE_TYPE_PDE_DISABLED);
     if (    PGM_PAGE_GET_STATE(pLargePage) != PGM_PAGE_STATE_ALLOCATED
         ||  PGM_PAGE_GET_TYPE(pLargePage) != PGMPAGETYPE_RAM
-        ||  PGM_PAGE_GET_HNDL_PHYS_STATE(pLargePage) != PGM_PAGE_HNDL_PHYS_STATE_NONE)
+        ||  PGM_PAGE_GET_HNDL_PHYS_STATE(pLargePage) != PGM_PAGE_HNDL_PHYS_STATE_NONE
+        ||  PGM_PAGE_GET_VMI_DENIED(pLargePage))
     {
         LogFlow(("pgmPhysRecheckLargePage: checks failed for base page %x %x %x\n", PGM_PAGE_GET_STATE(pLargePage), PGM_PAGE_GET_TYPE(pLargePage), PGM_PAGE_GET_HNDL_PHYS_STATE(pLargePage)));
         return VERR_PGM_INVALID_LARGE_PAGE_RANGE;
@@ -2604,7 +2608,8 @@ int pgmPhysRecheckLargePage(PVMCC pVM, RTGCPHYS GCPhys, PPGMPAGE pLargePage)
         if (    PGM_PAGE_GET_STATE(pPage) != PGM_PAGE_STATE_ALLOCATED
             ||  PGM_PAGE_GET_PDE_TYPE(pPage) != PGM_PAGE_PDE_TYPE_PDE
             ||  PGM_PAGE_GET_TYPE(pPage) != PGMPAGETYPE_RAM
-            ||  PGM_PAGE_GET_HNDL_PHYS_STATE(pPage) != PGM_PAGE_HNDL_PHYS_STATE_NONE)
+            ||  PGM_PAGE_GET_HNDL_PHYS_STATE(pPage) != PGM_PAGE_HNDL_PHYS_STATE_NONE
+            ||  PGM_PAGE_GET_VMI_DENIED(pPage))
         {
             LogFlow(("pgmPhysRecheckLargePage: checks failed for page %d; %x %x %x\n", i, PGM_PAGE_GET_STATE(pPage), PGM_PAGE_GET_TYPE(pPage), PGM_PAGE_GET_HNDL_PHYS_STATE(pPage)));
             break;
@@ -5495,6 +5500,14 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS
         }
 
         /*
+         * VBoxVMI: restricted pages and every page of an instruction emulated
+         * for a reply must reach IEM's checked bounce buffers and slow fetch.
+         */
+        if (RT_UNLIKELY(   PGM_PAGE_GET_VMI_DENIED(&PageCopy)
+                        || pVCpu->pgm.s.Vmi.fEmulating))
+            return pgmPhyIemGCphys2PtrNoLockReturnNoNothing(uTlbPhysRev, ppb, pfTlb, GCPhys, &PageCopy);
+
+        /*
          * Try optimize for the regular case first: Writable RAM.
          */
         switch (PGM_PAGE_GET_HNDL_PHYS_STATE(&PageCopy))
@@ -5602,7 +5615,9 @@ VMM_INT_DECL(int) PGMPhysIemGCPhys2Ptr(PVMCC pVM, PVMCPUCC pVCpu, RTGCPHYS GCPhy
     {
         if (PGM_PAGE_IS_BALLOONED(pPage))
             rc = VERR_PGM_PHYS_TLB_CATCH_WRITE;
-        else if (PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage))
+        else if (   PGM_PAGE_IS_SPECIAL_ALIAS_MMIO(pPage)
+                 || PGM_PAGE_GET_VMI_DENIED(pPage)   /* VBoxVMI: checked when bounce buffering. */
+                 || pVCpu->pgm.s.Vmi.fEmulating)
             rc = VERR_PGM_PHYS_TLB_CATCH_ALL;
         else if (   !PGM_PAGE_HAS_ANY_HANDLERS(pPage)
                  || (fByPassHandlers && !PGM_PAGE_IS_MMIO(pPage)) )
@@ -5726,6 +5741,165 @@ VMM_INT_DECL(int) PGMPhysIemQueryAccess(PVMCC pVM, RTGCPHYS GCPhys, bool fWritab
     PGM_UNLOCK(pVM);
     return rc;
 }
+
+/**
+ * Gets the accesses allowed in this vCPU's EPT view.  Restrictions only
+ * change in an EMT rendezvous, so this lookup needs no lock on a vCPU.
+ *
+ * @returns Allowed VMI_PAGE_ACCESS_XXX, RWX when unwatched or unrestricted.
+ * @param   pVCpu      The calling vCPU.
+ * @param   GCPhys     The guest-physical address.
+ */
+VMM_INT_DECL(uint32_t) PGMPhysVmiGetPageAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys)
+{
+    if (RT_LIKELY(!pVCpu->pgm.s.Vmi.fIntercept))
+        return VMI_PAGE_ACCESS_RWX;
+    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+    if (RT_LIKELY(!pVM->pgm.s.cVmiRestrictedPages))
+        return VMI_PAGE_ACCESS_RWX;
+    PPGMPAGE pPage = pgmPhysGetPage(pVM, GCPhys);
+    if (!pPage || PGM_PAGE_GET_TYPE(pPage) != PGMPAGETYPE_RAM)
+        return VMI_PAGE_ACCESS_RWX;
+    return VMI_PAGE_ACCESS_RWX & ~PGM_PAGE_GET_VMI_DENIED(pPage);
+}
+
+
+/**
+ * Checks a vCPU access against the VBoxVMI page access restrictions.
+ *
+ * Used by the VT-x EPT violation handler and by IEM before an access takes
+ * effect.  Only vCPUs with the page-access intercept report accesses; the
+ * others, and an instruction VBoxVMI emulates for an event reply, perform them.
+ *
+ * @returns Strict VBox status code.
+ * @retval  VINF_SUCCESS if the access may be performed.
+ * @retval  VINF_EM_DBG_BREAKPOINT if it is to be reported: PGMCPU::Vmi holds
+ *          the access for VMIR3DebugEvent, and the instruction must not
+ *          execute.
+ * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
+ * @param   GCPhys      The guest-physical address accessed.
+ * @param   GCPtr       The guest-linear address accessed, zero if unknown.
+ * @param   fAccess     The accesses, VMI_PAGE_ACCESS_XXX.  The single one
+ *                      reported is execute, else write, else read.
+ */
+VMM_INT_DECL(VBOXSTRICTRC) PGMPhysVmiCheckAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys, RTGCPTR GCPtr, uint32_t fAccess)
+{
+#ifdef IN_RING3
+    if (RT_UNLIKELY(pVCpu->pgm.s.Vmi.fEmulating))
+        /* Never invoke a handler whose effects the RAM journal cannot undo. */
+        return PGMPhysVmiIsEmulationRam(pVCpu->CTX_SUFF(pVM), GCPhys, fAccess) ? VINF_SUCCESS : VERR_NOT_SUPPORTED;
+#endif
+    uint32_t const fDenied = fAccess & ~PGMPhysVmiGetPageAccess(pVCpu, GCPhys);
+    if (!fDenied)
+        return VINF_SUCCESS;
+    pVCpu->pgm.s.Vmi.fHitAccess = fDenied & VMI_PAGE_ACCESS_X ? VMI_PAGE_ACCESS_X
+                                : fDenied & VMI_PAGE_ACCESS_W ? VMI_PAGE_ACCESS_W : VMI_PAGE_ACCESS_R;
+    pVCpu->pgm.s.Vmi.GCPhysHit  = GCPhys;
+    pVCpu->pgm.s.Vmi.GCPtrHit   = GCPtr;
+    return VINF_EM_DBG_BREAKPOINT;
+}
+
+
+/**
+ * Replaces data an instruction VBoxVMI emulates reads with the read data of
+ * an EMULATE_READ_DATA reply.
+ *
+ * The reads consume the data in order; bytes past its end read as zero.
+ *
+ * @returns true if @a pvBuf was replaced, false if no such reply runs.
+ * @param   pVCpu       The cross context virtual CPU structure of the calling EMT.
+ * @param   pvBuf       The bytes read.
+ * @param   cbBuf       Their number.
+ */
+VMM_INT_DECL(bool) PGMPhysVmiEmulReadData(PVMCPUCC pVCpu, void *pvBuf, size_t cbBuf)
+{
+#ifdef IN_RING3
+    uint16_t const cbData = pVCpu->pgm.s.Vmi.cbReadData;
+    if (RT_LIKELY(!cbData))
+        return false;
+    uint16_t const off    = pVCpu->pgm.s.Vmi.offReadData;
+    size_t const   cbCopy = RT_MIN(cbBuf, (size_t)(cbData - off));
+    memcpy(pvBuf, &pVCpu->pgm.s.Vmi.pbReadData[off], cbCopy);
+    memset((uint8_t *)pvBuf + cbCopy, 0, cbBuf - cbCopy);
+    pVCpu->pgm.s.Vmi.offReadData = (uint16_t)(off + cbCopy);
+    return true;
+#else
+    RT_NOREF(pVCpu, pvBuf, cbBuf);
+    return false;
+#endif
+}
+
+
+#ifdef IN_RING3
+/** Accept RAM accesses only when no physical handler callback can run. */
+VMMR3_INT_DECL(bool) PGMPhysVmiIsEmulationRam(PVMCC pVM, RTGCPHYS GCPhys, uint32_t fAccess)
+{
+    PGM_LOCK_VOID(pVM);
+    PPGMPAGE pPage = pgmPhysGetPage(pVM, GCPhys);
+    /* shortcut: callback-bearing accesses are unsupported, upgrade only with transactional handler side effects. */
+    bool const fSafe = pPage && PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_RAM
+                    && (   !PGM_PAGE_HAS_ACTIVE_HANDLERS(pPage)
+                        || (   !(fAccess & VMI_PAGE_ACCESS_W)
+                            && !PGM_PAGE_HAS_ACTIVE_ALL_HANDLERS(pPage)));
+    PGM_UNLOCK(pVM);
+    return fSafe;
+}
+
+
+/** Original RAM bytes to restore when an emulated instruction fails. */
+typedef struct PGMVMIWRITE
+{
+    struct PGMVMIWRITE *pNext;
+    RTGCPHYS           GCPhys;
+    size_t             cb;
+    uint8_t            abOld[1];
+} PGMVMIWRITE;
+
+
+/** Saves the old bytes before IEM commits a bounce-buffered write. */
+VMMR3_INT_DECL(int) PGMPhysVmiJournalWrite(PVMCPUCC pVCpu, RTGCPHYS GCPhys, size_t cb)
+{
+    Assert(pVCpu->pgm.s.Vmi.fEmulating);
+    Assert(cb && (GCPhys & GUEST_PAGE_OFFSET_MASK) + cb <= GUEST_PAGE_SIZE);
+    PVM pVM = pVCpu->CTX_SUFF(pVM);
+    if (!PGMPhysVmiIsEmulationRam(pVM, GCPhys, VMI_PAGE_ACCESS_W))
+        return VERR_NOT_SUPPORTED; /* Handler callbacks cannot be rolled back with RAM. */
+
+    PGMVMIWRITE *pWrite = (PGMVMIWRITE *)RTMemAlloc(RT_UOFFSETOF(PGMVMIWRITE, abOld) + cb);
+    if (!pWrite)
+        return VERR_NO_MEMORY;
+    int rc = PGMPhysSimpleReadGCPhys(pVM, pWrite->abOld, GCPhys, cb);
+    if (RT_FAILURE(rc))
+    {
+        RTMemFree(pWrite);
+        return rc;
+    }
+    pWrite->GCPhys = GCPhys;
+    pWrite->cb = cb;
+    pWrite->pNext = (PGMVMIWRITE *)pVCpu->pgm.s.Vmi.pvJournal;
+    pVCpu->pgm.s.Vmi.pvJournal = pWrite;
+    return VINF_SUCCESS;
+}
+
+
+/** Discards a successful emulation's journal or restores failed writes in reverse order. */
+VMMR3_INT_DECL(void) PGMPhysVmiEndEmulation(PVMCPUCC pVCpu, bool fCommit)
+{
+    PGMVMIWRITE *pWrite = (PGMVMIWRITE *)pVCpu->pgm.s.Vmi.pvJournal;
+    pVCpu->pgm.s.Vmi.pvJournal = NULL;
+    while (pWrite)
+    {
+        PGMVMIWRITE *pNext = pWrite->pNext;
+        if (!fCommit)
+        {
+            int rc = PGMPhysSimpleWriteGCPhys(pVCpu->CTX_SUFF(pVM), pWrite->GCPhys, pWrite->abOld, pWrite->cb);
+            AssertLogRelRC(rc);
+        }
+        RTMemFree(pWrite);
+        pWrite = pNext;
+    }
+}
+#endif /* IN_RING3 */
 
 #ifdef VBOX_WITH_NATIVE_NEM
 

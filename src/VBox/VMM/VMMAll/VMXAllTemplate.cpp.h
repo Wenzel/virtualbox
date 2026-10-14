@@ -9881,6 +9881,46 @@ HMVMX_EXIT_DECL vmxHCExitEptViolation(PVMCPUCC pVCpu, PVMXTRANSIENT pVmxTransien
     PVMCC    pVM  = pVCpu->CTX_SUFF(pVM);
 
     /*
+     * VBoxVMI restrictions exist only in the watched EPT view.  An unwatched
+     * vCPU uses the unrestricted view and reaches PGM for its normal handlers;
+     * it must never rely on IEM supporting the faulting instruction.
+     */
+    uint32_t const fVmiAllowed = PGMPhysVmiGetPageAccess(pVCpu, GCPhys);
+    if (fVmiAllowed != VMI_PAGE_ACCESS_RWX)
+    {
+        uint32_t const fVmiAccess = (uExitQual & VMX_EXIT_QUAL_EPT_ACCESS_READ        ? VMI_PAGE_ACCESS_R : 0)
+                                  | (uExitQual & VMX_EXIT_QUAL_EPT_ACCESS_WRITE       ? VMI_PAGE_ACCESS_W : 0)
+                                  | (uExitQual & VMX_EXIT_QUAL_EPT_ACCESS_INSTR_FETCH ? VMI_PAGE_ACCESS_X : 0);
+        RTGCPTR GCPtrVmi = 0;
+        if (uExitQual & VMX_EXIT_QUAL_EPT_LINEAR_ADDR_VALID)
+        {
+            vmxHCReadToTransient<HMVMX_READ_GUEST_LINEAR_ADDR>(pVCpu, pVmxTransient);
+            GCPtrVmi = pVmxTransient->uGuestLinearAddr;
+        }
+        rcStrict = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrVmi, fVmiAccess);
+        if (rcStrict != VINF_SUCCESS)
+            return rcStrict; /* Reported by VMIR3DebugEvent, a pending event becomes a TRPM trap meanwhile. */
+        if (   (fVmiAccess & ~fVmiAllowed)
+            || !(fVmiAllowed & VMI_PAGE_ACCESS_R))
+        {
+            if (VCPU_2_VMXSTATE(pVCpu).Event.fPending)
+                return VINF_EM_RAW_INJECT_TRPM_EVENT; /* IEM delivers it in ring-3. */
+            rc = vmxHCImportGuestState<HMVMX_CPUMCTX_EXTRN_ALL>(pVCpu, pVmcsInfo, __FUNCTION__);
+            AssertRCReturn(rc, rc);
+            rcStrict = IEMExecOne(pVCpu);
+            if (rcStrict == VINF_IEM_RAISED_XCPT)
+            {
+                ASMAtomicUoOrU64(&VCPU_2_VMXSTATE(pVCpu).fCtxChanged, HM_CHANGED_RAISED_XCPT_MASK);
+                return VINF_SUCCESS;
+            }
+            ASMAtomicUoOrU64(&VCPU_2_VMXSTATE(pVCpu).fCtxChanged, HM_CHANGED_ALL_GUEST);
+            if (RT_FAILURE(rcStrict))
+                return VINF_EM_RAW_EMULATE_INSTR; /* Ring-3 IEM may do better. */
+            return rcStrict;
+        }
+    }
+
+    /*
      * Handle the pagefault trap for the nested shadow table.
      */
     TRPMAssertXcptPF(pVCpu, GCPhys, uErrorCode);

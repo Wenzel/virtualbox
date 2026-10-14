@@ -2200,7 +2200,7 @@ int pgmR3PhysRamPreAllocate(PVM pVM)
  */
 void pgmR3PhysAssertSharedPageChecksums(PVM pVM)
 {
-#ifdef VBOX_STRICT
+#if defined(VBOX_STRICT) && !defined(VBOX_WITH_VMI) /* VBoxVMI keeps page access restrictions in the checksum bits. */
     PGM_LOCK_VOID(pVM);
 
     if (pVM->pgm.s.cSharedPages > 0)
@@ -2225,7 +2225,7 @@ void pgmR3PhysAssertSharedPageChecksums(PVM pVM)
                 PPGMPAGE pPage = &pRam->aPages[iPage];
                 if (PGM_PAGE_IS_SHARED(pPage))
                 {
-                    uint32_t u32Checksum = pPage->s.u2Unused0/* | ((uint32_t)pPage->s.u2Unused1 << 8)*/;
+                    uint32_t u32Checksum = pPage->s.u3VmiDeniedY/* | ((uint32_t)pPage->s.u2Unused1 << 8)*/;
                     if (!u32Checksum)
                     {
                         RTGCPHYS    GCPhysPage  = pRam->GCPhys + ((RTGCPHYS)iPage << GUEST_PAGE_SHIFT);

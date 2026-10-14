@@ -706,8 +706,9 @@ typedef union PGMPAGE
          *
          * @note Can possibly be set on ROM pages that are not in the monitored state. */
         uint64_t    fCodePageY          : 1;
-        /** 7:5   - Unused. */
-        uint64_t    u2Unused0           : 3;
+        /** 7:5   - VBoxVMI page access restriction: the denied VMI_PAGE_ACCESS_XXX
+         *  of a RAM page, zero if none (VMIR3.cpp). */
+        uint64_t    u3VmiDeniedY        : 3;
         /** 9:8   - Paging structure needed to map the page
          * (PGM_PAGE_PDE_TYPE_*). */
         uint64_t    u2PDETypeY          : 2;
@@ -1199,6 +1200,21 @@ typedef PPGMPAGE *PPPGMPAGE;
  * @param   a_pPage     Pointer to the physical guest page tracking structure.
  */
 #define PGM_PAGE_IS_HNDL_PHYS_NOT_IN_HM(a_pPage) ((a_pPage)->s.fHandlerPhysNotInHm)
+
+/** @def PGM_PAGE_GET_VMI_DENIED
+ * Gets the accesses a VBoxVMI page access restriction denies.
+ * @returns The denied VMI_PAGE_ACCESS_XXX, zero if the page is unrestricted.
+ * @param   a_pPage     Pointer to the physical guest page tracking structure.
+ */
+#define PGM_PAGE_GET_VMI_DENIED(a_pPage)        ( (uint32_t)(a_pPage)->s.u3VmiDeniedY )
+
+/** @def PGM_PAGE_SET_VMI_DENIED
+ * Sets the accesses a VBoxVMI page access restriction denies.
+ * @param   a_pPage     Pointer to the physical guest page tracking structure.
+ * @param   a_fDenied   The denied VMI_PAGE_ACCESS_XXX, zero for none.
+ */
+#define PGM_PAGE_SET_VMI_DENIED(a_pPage, a_fDenied) \
+    do { (a_pPage)->s.u3VmiDeniedY = (a_fDenied); } while (0)
 
 /** @def PGM_PAGE_GET_TRACKING
  * Gets the packed shadow page pool tracking data associated with a guest page.
@@ -2087,7 +2103,8 @@ typedef struct PGMPOOLPAGE
     /** Used to mark the page as dirty (write monitoring is temporarily
      *  off). */
     bool                fDirty : 1;
-    bool                fPadding1 : 1;
+    /** EPT view without VBoxVMI restrictions; inherited from the parent pool page. */
+    bool                fVmiUnwatched : 1;
     bool                fPadding2;
 
     /** The index of this page. */
@@ -3315,7 +3332,9 @@ typedef struct PGM
 #endif
     uint32_t                        cLargePages;            /**< The number of large pages. */
     uint32_t                        cLargePagesDisabled;    /**< The number of disabled large pages. */
-/*    uint32_t                        aAlignment4[1]; */
+    /** The number of pages with a VBoxVMI page access restriction
+     * (PGMPAGE::u3VmiDeniedY), changed in an EMT rendezvous. */
+    uint32_t                        cVmiRestrictedPages;
 
     STAMPROFILE                     StatLargePageAlloc;     /**< Time spent by the host OS for large page allocation. */
     STAMCOUNTER                     StatLargePageAllocFailed; /**< Count allocation failures. */
@@ -3718,6 +3737,7 @@ typedef struct PGMCPU
     /** @} */
 
 # ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
+    /** The active EPT root is keyed by the page-access intercept view. */
     /** Pointer to the page of the current active CR3 - R3 Ptr. */
     R3PTRTYPE(PPGMPOOLPAGE)         pShwPageCR3R3;
     /** Pointer to the page of the current active CR3 - R0 Ptr. */
@@ -3754,6 +3774,32 @@ typedef struct PGMCPU
 
     /** Count the number of pgm pool access handler calls. */
     uint64_t                        cPoolAccessHandler;
+
+    /** VBoxVMI page access state of this vCPU (VMIR3.cpp, PGMPhysVmiCheckAccess). */
+    struct PGMCPUVMI
+    {
+        /** Set while the vCPU has the page-access intercept: restricted accesses
+         *  are reported instead of performed. */
+        bool                        fIntercept;
+        /** Set while VBoxVMI emulates an instruction for an event reply: no
+         *  restriction applies. */
+        bool                        fEmulating;
+        /** The reported access, VMI_PAGE_ACCESS_XXX; zero if none is pending. */
+        uint8_t                     fHitAccess;
+        uint8_t                     bPadding;
+        /** Bytes of pbReadData the emulated instruction has read. */
+        uint16_t                    offReadData;
+        /** Size of pbReadData, zero unless an EMULATE_READ_DATA reply runs. */
+        uint16_t                    cbReadData;
+        /** Guest-physical address of the reported access. */
+        RTGCPHYS                    GCPhysHit;
+        /** Guest-linear address of the reported access, zero if unknown. */
+        RTGCPTR                     GCPtrHit;
+        /** The read data of an EMULATE_READ_DATA reply (ring-3 only). */
+        R3PTRTYPE(uint8_t const *)  pbReadData;
+        /** Original RAM bytes of writes made during the current emulation (ring-3 only). */
+        R3PTRTYPE(void *)           pvJournal;
+    } Vmi;
 
     /** Lockless RAM range TLB for R3. */
     R3PTRTYPE(PPGMRAMRANGE)         apRamRangesTlb[PGM_RAMRANGE_TLB_ENTRIES];
@@ -4044,6 +4090,9 @@ int             pgmR0PoolInitVM(PGVM pGVM);
 # endif
 int             pgmPoolAlloc(PVMCC pVM, RTGCPHYS GCPhys, PGMPOOLKIND enmKind, PGMPOOLACCESS enmAccess, bool fA20Enabled,
                              uint16_t iUser, uint32_t iUserTable, bool fLockPage, PPPGMPOOLPAGE ppPage);
+# if defined(IN_RING3) && defined(VBOX_VMM_TARGET_X86)
+int             pgmVmiSwitchEptView(PVMCPU pVCpu, bool fIntercept);
+# endif
 void            pgmPoolFree(PVM pVM, RTHCPHYS HCPhys, uint16_t iUser, uint32_t iUserTable);
 void            pgmPoolFreeByPage(PPGMPOOL pPool, PPGMPOOLPAGE pPage, uint16_t iUser, uint32_t iUserTable);
 int             pgmPoolFlushPage(PPGMPOOL pPool, PPGMPOOLPAGE pPage, bool fFlush = true /* DO NOT USE false UNLESS YOU KNOWN WHAT YOU'RE DOING!! */);
