@@ -152,6 +152,8 @@ typedef struct VMIR3
     uint32_t        cEvents;
     /** Per-vCPU event state, cCpus entries. */
     PVMIR3CPU       paCpus;
+    /** Allocation state of the startup-reserved Hidden pages. */
+    uint8_t        *pbHiddenAllocated;
     /** Distinguishes an event wakeup from termination on the same pipe. */
     bool volatile   fTerminating;
     /** Pipe for waking the server on an event or termination: [0] read, [1] write. */
@@ -368,7 +370,7 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
         case VMI_INTERCEPT_PAGE_ACCESS:
 #ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
         {
-            int rc = pgmVmiSwitchEptView(pVCpu, fSet);
+            int rc = pgmVmiSwitchEptView(pVCpu, pVCpu->pgm.s.Vmi.idView, fSet);
             if (RT_FAILURE(rc))
                 return rc;
             ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR3);
@@ -411,6 +413,7 @@ static DECLCALLBACK(int) vmiR3InterceptOnEmt(PVM pVM, uint32_t uKind, uint32_t u
  */
 typedef struct VMIR3PAGEACCESSSET
 {
+    uint16_t    idView;
     RTGCPHYS    GCPhys;
     /** The allowed VMI_PAGE_ACCESS_XXX. */
     uint32_t    fAllowed;
@@ -436,67 +439,52 @@ static int vmiR3PageAccessLookup(PVM pVM, RTGCPHYS GCPhys, PPGMPAGE *ppPage)
 }
 
 
-/**
- * Changes the restriction of one page, PGM lock held, in the rendezvous.
- *
- * Drops the page's shadow EPT entries (breaking up a large page), so that the
- * next access maps it with the new permissions (see SyncPageWorker).
- *
- * @returns true if the shadow page pool must be cleared (untracked mappings,
- *          e.g. of the zero page).
- */
-static bool vmiR3PageAccessChange(PVM pVM, RTGCPHYS GCPhysPage, PPGMPAGE pPage, uint32_t fDenied)
+/** Frees one sparse Memory-view page while destroying the tree. */
+static DECLCALLBACK(int) vmiR3FreeViewPage(PAVLOGCPHYSNODECORE pNode, void *pvUser)
 {
-    uint32_t const fOld = PGM_PAGE_GET_VMI_DENIED(pPage);
-    PGM_PAGE_SET_VMI_DENIED(pPage, fDenied);
-    if (!fOld)
-    {
-        pVM->pgm.s.cVmiRestrictedPages++;
-        ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts); /* Debugger exclusion, like intercepts. */
-    }
-    else if (!fDenied)
-    {
-        pVM->pgm.s.cVmiRestrictedPages--;
-        ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
-    }
-    bool fFlushTlbs = false;
-    int rc = pgmPoolTrackUpdateGCPhys(pVM, GCPhysPage, pPage, true /*fFlushPTEs*/, &fFlushTlbs);
-    AssertLogRelMsg(rc == VINF_SUCCESS || rc == VINF_PGM_SYNC_CR3, ("%Rrc\n", rc));
-    return rc != VINF_SUCCESS;
+    RT_NOREF(pvUser);
+    MMR3HeapFree(pNode);
+    return VINF_SUCCESS;
 }
 
+/** Gets or creates sparse Memory-view state for a RAM page, PGM lock held. */
+static int vmiR3GetViewPage(PVM pVM, RTGCPHYS GCPhys, bool fCreate, PPGMVMIPAGE *ppVmiPage)
+{
+    RTGCPHYS const GCPhysPage = GCPhys & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK;
+    *ppVmiPage = (PPGMVMIPAGE)RTAvloGCPhysGet(&pVM->pgm.s.VmiPages, GCPhysPage);
+    if (*ppVmiPage || !fCreate)
+        return VINF_SUCCESS;
+    *ppVmiPage = (PPGMVMIPAGE)MMR3HeapAllocZ(pVM, MM_TAG_PGM, sizeof(**ppVmiPage));
+    if (!*ppVmiPage)
+        return VERR_NO_MEMORY;
+    (*ppVmiPage)->Core.Key = GCPhysPage;
+    for (uint32_t idView = 0; idView < VMI_MEMORY_VIEW_MAX; idView++)
+        (*ppVmiPage)->aidRemap[idView] = VMI_REMAP_RESTORE_PAGE;
+    if (!RTAvloGCPhysInsert(&pVM->pgm.s.VmiPages, &(*ppVmiPage)->Core))
+    {
+        MMR3HeapFree(*ppVmiPage);
+        return VERR_ALREADY_EXISTS;
+    }
+    return VINF_SUCCESS;
+}
 
 /**
- * @callback_method_impl{FNVMMEMTRENDEZVOUS,
- *      Sets a page access restriction or removes all of them.}
+ * Sets a page restriction or removes every session restriction in a rendezvous.
  *
- * A rendezvous, so that no vCPU runs with stale EPT entries or IEM TLBs once
- * the request is answered, and serialized with debugger attach.
+ * The Default view's restriction lives in the per-page PGMPAGE bits (`u3VmiDeniedY`), read and
+ * written from every context, same as before Memory views; other views live in the sparse
+ * `VmiPages` heap table, ring-3 only (`pgmVmiGetPageAccess`, `pgmVmiGetRemap`), so ring-0 and
+ * raw-mode never dereference it. Clearing the pool is deliberately coarse: view changes are
+ * control-plane operations.
  */
 static DECLCALLBACK(VBOXSTRICTRC) vmiR3PageAccessSetRendezvous(PVM pVM, PVMCPU pVCpu, void *pvUser)
 {
     VMIR3PAGEACCESSSET *pReq = (VMIR3PAGEACCESSSET *)pvUser;
-    uint32_t const fDenied = VMI_PAGE_ACCESS_RWX & ~pReq->fAllowed;
-    bool fClearPool = false;
-    bool fChanged   = false;
     PGM_LOCK_VOID(pVM);
-    if (pReq->GCPhys != NIL_RTGCPHYS)
+    bool fChanged = false;
+    if (pReq->GCPhys == NIL_RTGCPHYS)
     {
-        PPGMPAGE pPage;
-        pReq->rc = vmiR3PageAccessLookup(pVM, pReq->GCPhys, &pPage);
-        if (RT_SUCCESS(pReq->rc) && PGM_PAGE_GET_VMI_DENIED(pPage) != fDenied)
-        {
-            if (fDenied && pVM->dbgf.s.fAttached)
-                pReq->rc = VERR_DBGF_ALREADY_ATTACHED;
-            else
-            {
-                fClearPool = vmiR3PageAccessChange(pVM, pReq->GCPhys & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK, pPage, fDenied);
-                fChanged   = true;
-            }
-        }
-    }
-    else
-    {
+        Assert(pReq->idView == VMI_MEMORY_VIEW_DEFAULT);
         uint32_t const cLookupEntries = RT_MIN(pVM->pgm.s.RamRangeUnion.cLookupEntries, RT_ELEMENTS(pVM->pgm.s.aRamRangeLookup));
         for (uint32_t idxLookup = 0; idxLookup < cLookupEntries; idxLookup++)
         {
@@ -507,20 +495,59 @@ static DECLCALLBACK(VBOXSTRICTRC) vmiR3PageAccessSetRendezvous(PVM pVM, PVMCPU p
             for (uint32_t iPage = 0; iPage < (pRam->cb >> GUEST_PAGE_SHIFT); iPage++)
                 if (PGM_PAGE_GET_VMI_DENIED(&pRam->aPages[iPage]))
                 {
-                    fClearPool |= vmiR3PageAccessChange(pVM, pRam->GCPhys + ((RTGCPHYS)iPage << GUEST_PAGE_SHIFT),
-                                                        &pRam->aPages[iPage], 0);
+                    PGM_PAGE_SET_VMI_DENIED(&pRam->aPages[iPage], 0);
                     fChanged = true;
                 }
         }
-        /* Restrictions of pages PGM re-initialised (e.g. mapped MMIO2 over): nothing left to undo. */
-        ASMAtomicSubU32(&pVM->dbgf.s.cVmiIntercepts, pVM->pgm.s.cVmiRestrictedPages);
-        pVM->pgm.s.cVmiRestrictedPages = 0;
+        if (pVM->pgm.s.cVmiRestrictedPages)
+        {
+            ASMAtomicSubU32(&pVM->dbgf.s.cVmiIntercepts, pVM->pgm.s.cVmiRestrictedPages);
+            pVM->pgm.s.cVmiRestrictedPages = 0;
+        }
+        RTAvloGCPhysDestroy(&pVM->pgm.s.VmiPages, vmiR3FreeViewPage, pVM);
         pReq->rc = VINF_SUCCESS;
     }
-    if (fClearPool)
-        pgmR3PoolClearAllRendezvous(pVM, pVCpu, NULL);
+    else
+    {
+        PPGMPAGE pPage;
+        pReq->rc = vmiR3PageAccessLookup(pVM, pReq->GCPhys, &pPage);
+        uint8_t const fDenied = (uint8_t)(VMI_PAGE_ACCESS_RWX & ~pReq->fAllowed);
+        if (RT_SUCCESS(pReq->rc) && fDenied && pVM->dbgf.s.fAttached)
+            pReq->rc = VERR_DBGF_ALREADY_ATTACHED;
+        else if (RT_SUCCESS(pReq->rc))
+        {
+            uint8_t fOld;
+            PPGMVMIPAGE pVmiPage = NULL;
+            if (pReq->idView == VMI_MEMORY_VIEW_DEFAULT)
+                fOld = (uint8_t)PGM_PAGE_GET_VMI_DENIED(pPage);
+            else
+            {
+                pReq->rc = vmiR3GetViewPage(pVM, pReq->GCPhys, fDenied != 0, &pVmiPage);
+                fOld = RT_SUCCESS(pReq->rc) && pVmiPage ? pVmiPage->afDenied[pReq->idView] : 0;
+            }
+            if (RT_SUCCESS(pReq->rc) && fOld != fDenied)
+            {
+                if (!fOld)
+                {
+                    pVM->pgm.s.cVmiRestrictedPages++;
+                    ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts);
+                }
+                else if (!fDenied)
+                {
+                    pVM->pgm.s.cVmiRestrictedPages--;
+                    ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
+                }
+                if (pReq->idView == VMI_MEMORY_VIEW_DEFAULT)
+                    PGM_PAGE_SET_VMI_DENIED(pPage, fDenied);
+                else
+                    pVmiPage->afDenied[pReq->idView] = fDenied;
+                fChanged = true;
+            }
+        }
+    }
     if (fChanged)
     {
+        pgmR3PoolClearAllRendezvous(pVM, pVCpu, NULL);
         PGM_INVL_ALL_VCPU_TLBS(pVM);
         IEMTlbInvalidateAllPhysicalAllCpus(pVM, pVCpu->idCpu, IEMTLBPHYSFLUSHREASON_MISC);
     }
@@ -543,6 +570,8 @@ static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
     for (uint32_t i = 0; i < pVCpu->hm.s.Vmi.cMsrs; i++) /* Clearing keeps the entries, see above. */
         vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_MSR_WRITE, pVCpu->hm.s.Vmi.aMsrs[i].idMsr, false);
     vmiR3InterceptOnEmt(pVM, VMI_INTERCEPT_PAGE_ACCESS, 0, false);
+    if (pVCpu->pgm.s.Vmi.idView != VMI_MEMORY_VIEW_DEFAULT)
+        pgmVmiSwitchEptView(pVCpu, VMI_MEMORY_VIEW_DEFAULT, false);
     pVCpu->hm.s.Vmi.fSkipHit = false;
     pThis->paCpus[pVCpu->idCpu].fParked = false;
 #else
@@ -558,12 +587,17 @@ static DECLCALLBACK(int) vmiR3ClearOnEmt(PVM pVM, PVMIR3 pThis)
  */
 static void vmiR3CleanupSession(PVMIR3 pThis)
 {
+    if (pThis->pbHiddenAllocated)
+        RT_BZERO(pThis->pbHiddenAllocated, pThis->pUVM->pVM->pgm.s.cVmiHiddenPages);
 #ifdef VBOX_VMM_TARGET_X86
     PVM const pVM = pThis->pUVM->pVM;
-    if (pVM->pgm.s.cVmiRestrictedPages && VMR3GetStateU(pThis->pUVM) < VMSTATE_POWERING_OFF)
+    if (pVM->pgm.s.bmVmiViews && VMR3GetStateU(pThis->pUVM) < VMSTATE_POWERING_OFF)
     {
-        VMIR3PAGEACCESSSET Req = { NIL_RTGCPHYS, VMI_PAGE_ACCESS_RWX, VINF_SUCCESS };
+        VMIR3PAGEACCESSSET Req = {
+            VMI_MEMORY_VIEW_DEFAULT, NIL_RTGCPHYS, VMI_PAGE_ACCESS_RWX, VINF_SUCCESS
+        };
         int rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE, vmiR3PageAccessSetRendezvous, &Req);
+        pVM->pgm.s.bmVmiViews = 0;
         if (RT_FAILURE(rc))
             LogRel(("VMI: Cannot remove the page access restrictions: %Rrc\n", rc));
     }
@@ -941,15 +975,19 @@ static bool vmiR3HandleRamRanges(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
     if (RT_SUCCESS(rc))
     {
         /* PGM lists them from the highest address down. */
+        uint64_t cReplyRanges = 0;
         for (uint64_t i = 0; i < pList->cRanges; i++)
         {
             PGMPHYSRANGE const *pSrc = &pList->aRanges[pList->cRanges - 1 - i];
+            if (   pThis->pUVM->pVM->pgm.s.cVmiHiddenPages
+                && pSrc->GCPhysStart == pThis->pUVM->pVM->pgm.s.GCPhysVmiHidden)
+                continue;
             VMIRAMRANGE Range;
             Range.GCPhysFirst = pSrc->GCPhysStart;
             Range.GCPhysLast  = pSrc->GCPhysStart + (pSrc->cPages << GUEST_PAGE_SHIFT) - 1;
-            memcpy(&pThis->abReply[i * sizeof(Range)], &Range, sizeof(Range));
+            memcpy(&pThis->abReply[cReplyRanges++ * sizeof(Range)], &Range, sizeof(Range));
         }
-        cbReply = pList->cRanges * sizeof(VMIRAMRANGE);
+        cbReply = cReplyRanges * sizeof(VMIRAMRANGE);
     }
     RTMemTmpFree(pList);
     return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, pThis->abReply, cbReply));
@@ -1568,6 +1606,17 @@ static DECLCALLBACK(int) vmiR3ReplyOnEmt(PVM pVM, PVMIR3 pThis, VMIEVENTREPLY co
     PVMIR3CPU const pCpu = &pThis->paCpus[pVCpu->idCpu];
     if (!pCpu->fParked)
         return VERR_INVALID_STATE;
+    if (pReq->idView != VMI_MEMORY_VIEW_KEEP && pReq->idView != pVCpu->pgm.s.Vmi.idView)
+    {
+#ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
+        int rc = pgmVmiSwitchEptView(pVCpu, pReq->idView, pVCpu->pgm.s.Vmi.fIntercept);
+        if (RT_FAILURE(rc))
+            return rc;
+        ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR3);
+#else
+        pVCpu->pgm.s.Vmi.idView = pReq->idView;
+#endif
+    }
     switch (pReq->uAction)
     {
         case VMI_EVENT_REPLY_CONTINUE:
@@ -1655,6 +1704,7 @@ VMMR3_INT_DECL(VBOXSTRICTRC) VMIR3DebugEvent(PVM pVM, PVMCPU pVCpu, uint32_t uKi
     VMIEVENT Event;
     RT_ZERO(Event);
     Event.idCpu = pVCpu->idCpu;
+    Event.idView = pVCpu->pgm.s.Vmi.idView;
     Event.uKind = uKind;
     bool const fWrite = uKind == VMI_INTERCEPT_CR_WRITE || uKind == VMI_INTERCEPT_MSR_WRITE;
     int rc = VINF_SUCCESS;
@@ -1830,6 +1880,265 @@ static bool vmiR3HandleIntercept(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbB
 }
 
 
+#ifdef VBOX_VMM_TARGET_X86
+/** Switches one EMT to a Memory view. */
+static DECLCALLBACK(VBOXSTRICTRC) vmiR3SwitchViewOnEmt(PVM pVM, PVMCPU pVCpu, void *pvUser)
+{
+    uint16_t const idView = (uint16_t)(uintptr_t)pvUser;
+#ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
+    int rc = pgmVmiSwitchEptView(pVCpu, idView, pVCpu->pgm.s.Vmi.fIntercept);
+    if (RT_SUCCESS(rc))
+        ASMAtomicUoOrU64(&pVCpu->hm.s.fCtxChanged, HM_CHANGED_GUEST_CR3);
+    RT_NOREF(pVM);
+    return rc;
+#else
+    RT_NOREF(pVM);
+    pVCpu->pgm.s.Vmi.idView = idView;
+    return VINF_SUCCESS;
+#endif
+}
+
+
+typedef struct VMIR3CLEARVIEW
+{
+    PVM      pVM;
+    uint16_t idView;
+} VMIR3CLEARVIEW;
+
+/** Clears one view's state from a sparse page. */
+static DECLCALLBACK(int) vmiR3ClearViewPage(PAVLOGCPHYSNODECORE pNode, void *pvUser)
+{
+    PPGMVMIPAGE pVmiPage = (PPGMVMIPAGE)pNode;
+    VMIR3CLEARVIEW *pClear = (VMIR3CLEARVIEW *)pvUser;
+    if (pVmiPage->afDenied[pClear->idView])
+    {
+        pVmiPage->afDenied[pClear->idView] = 0;
+        pClear->pVM->pgm.s.cVmiRestrictedPages--;
+        ASMAtomicDecU32(&pClear->pVM->dbgf.s.cVmiIntercepts);
+    }
+    pVmiPage->aidRemap[pClear->idView] = VMI_REMAP_RESTORE_PAGE;
+    return VINF_SUCCESS;
+}
+
+/** Clears one Memory view and stale translations in a rendezvous. */
+static DECLCALLBACK(VBOXSTRICTRC) vmiR3ClearViewRendezvous(PVM pVM, PVMCPU pVCpu, void *pvUser)
+{
+    VMIR3CLEARVIEW Clear = { pVM, (uint16_t)(uintptr_t)pvUser };
+    PGM_LOCK_VOID(pVM);
+    RTAvloGCPhysDoWithAll(&pVM->pgm.s.VmiPages, true, vmiR3ClearViewPage, &Clear);
+    pgmR3PoolClearAllRendezvous(pVM, pVCpu, NULL);
+    PGM_INVL_ALL_VCPU_TLBS(pVM);
+    IEMTlbInvalidateAllPhysicalAllCpus(pVM, pVCpu->idCpu, IEMTLBPHYSFLUSHREASON_MISC);
+    PGM_UNLOCK(pVM);
+    return VINF_SUCCESS;
+}
+
+typedef struct VMIR3REMAPREQ
+{
+    VMIREMAP Req;
+    int      rc;
+} VMIR3REMAPREQ;
+
+/** Changes one Remap and drops stale translations in a rendezvous. */
+static DECLCALLBACK(VBOXSTRICTRC) vmiR3RemapRendezvous(PVM pVM, PVMCPU pVCpu, void *pvUser)
+{
+    VMIR3REMAPREQ *pRemap = (VMIR3REMAPREQ *)pvUser;
+    RTGCPHYS const GCPhys = pRemap->Req.idPage * GUEST_PAGE_SIZE;
+    PGM_LOCK_VOID(pVM);
+    PPGMPAGE pPage;
+    pRemap->rc = vmiR3PageAccessLookup(pVM, GCPhys, &pPage);
+    if (RT_SUCCESS(pRemap->rc) && pRemap->Req.idTargetPage != VMI_REMAP_RESTORE_PAGE)
+        pRemap->rc = vmiR3PageAccessLookup(pVM, pRemap->Req.idTargetPage * GUEST_PAGE_SIZE, &pPage);
+    if (RT_SUCCESS(pRemap->rc))
+    {
+        PPGMVMIPAGE pVmiPage;
+        pRemap->rc = vmiR3GetViewPage(pVM, GCPhys,
+                                      pRemap->Req.idTargetPage != VMI_REMAP_RESTORE_PAGE, &pVmiPage);
+        if (RT_SUCCESS(pRemap->rc) && pVmiPage
+            && pVmiPage->aidRemap[pRemap->Req.idView] != pRemap->Req.idTargetPage)
+        {
+            pVmiPage->aidRemap[pRemap->Req.idView] = pRemap->Req.idTargetPage;
+            pgmR3PoolClearAllRendezvous(pVM, pVCpu, NULL);
+            PGM_INVL_ALL_VCPU_TLBS(pVM);
+            IEMTlbInvalidateAllPhysicalAllCpus(pVM, pVCpu->idCpu, IEMTLBPHYSFLUSHREASON_MISC);
+        }
+    }
+    PGM_UNLOCK(pVM);
+    return VINF_SUCCESS;
+}
+
+/** Handles Memory-view lifecycle and Remap requests. */
+static bool vmiR3HandleMemoryView(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    PVM const pVM = pThis->pUVM->pVM;
+    int rc = HMR3IsVmxEnabled(pThis->pUVM) && HMR3IsNestedPagingActive(pThis->pUVM)
+           ? VINF_SUCCESS : VERR_NOT_SUPPORTED;
+    uint16_t idReply = 0;
+    if (RT_SUCCESS(rc) && pHdr->uType == VMI_MSG_MEMORY_VIEWS)
+    {
+        uint32_t fEnable = 0;
+        if (cbBody != sizeof(fEnable))
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            memcpy(&fEnable, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(fEnable));
+            if (fEnable > 1)
+                rc = VERR_INVALID_PARAMETER;
+            else if (fEnable && !pVM->pgm.s.bmVmiViews)
+            {
+                if (pVM->dbgf.s.fAttached)
+                    rc = VERR_DBGF_ALREADY_ATTACHED;
+                else
+                {
+                    pVM->pgm.s.bmVmiViews = RT_BIT_32(VMI_MEMORY_VIEW_DEFAULT);
+                    ASMAtomicIncU32(&pVM->dbgf.s.cVmiIntercepts);
+                }
+            }
+            else if (!fEnable && pVM->pgm.s.bmVmiViews)
+            {
+                rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONE_BY_ONE,
+                                        vmiR3SwitchViewOnEmt, (void *)(uintptr_t)VMI_MEMORY_VIEW_DEFAULT);
+                if (RT_SUCCESS(rc))
+                {
+                    VMIR3PAGEACCESSSET Req = {
+                        VMI_MEMORY_VIEW_DEFAULT, NIL_RTGCPHYS, VMI_PAGE_ACCESS_RWX, VINF_SUCCESS
+                    };
+                    rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE,
+                                            vmiR3PageAccessSetRendezvous, &Req);
+                    if (RT_SUCCESS(rc))
+                    {
+                        pVM->pgm.s.bmVmiViews = 0;
+                        ASMAtomicDecU32(&pVM->dbgf.s.cVmiIntercepts);
+                    }
+                }
+            }
+        }
+    }
+    else if (RT_SUCCESS(rc) && !pVM->pgm.s.bmVmiViews)
+        rc = VERR_INVALID_STATE;
+    else if (RT_SUCCESS(rc) && pHdr->uType == VMI_MSG_MEMORY_VIEW_CREATE)
+    {
+        if (cbBody)
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            for (idReply = 1; idReply < VMI_MEMORY_VIEW_MAX; idReply++)
+                if (!(pVM->pgm.s.bmVmiViews & RT_BIT_32(idReply)))
+                    break;
+            if (idReply == VMI_MEMORY_VIEW_MAX)
+                rc = VERR_OUT_OF_RESOURCES;
+            else
+                pVM->pgm.s.bmVmiViews |= RT_BIT_32(idReply);
+        }
+    }
+    else if (RT_SUCCESS(rc) && pHdr->uType == VMI_MSG_MEMORY_VIEW_REMAP)
+    {
+        VMIR3REMAPREQ Remap;
+        if (cbBody != sizeof(Remap.Req))
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            memcpy(&Remap.Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Remap.Req));
+            if (   Remap.Req.u16Reserved || Remap.Req.u32Reserved
+                || Remap.Req.idView == VMI_MEMORY_VIEW_DEFAULT
+                || Remap.Req.idView >= VMI_MEMORY_VIEW_MAX
+                || !(pVM->pgm.s.bmVmiViews & RT_BIT_32(Remap.Req.idView))
+                || Remap.Req.idPage > (UINT64_MAX >> GUEST_PAGE_SHIFT)
+                || (Remap.Req.idTargetPage != VMI_REMAP_RESTORE_PAGE
+                    && Remap.Req.idTargetPage > (UINT64_MAX >> GUEST_PAGE_SHIFT)))
+                rc = VERR_INVALID_PARAMETER;
+            else
+            {
+                Remap.rc = VINF_SUCCESS;
+                rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE,
+                                        vmiR3RemapRendezvous, &Remap);
+                if (RT_SUCCESS(rc))
+                    rc = Remap.rc;
+            }
+        }
+    }
+    else if (RT_SUCCESS(rc))
+    {
+        VMIVIEWREQ Req;
+        if (cbBody != sizeof(Req))
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
+            if (Req.u16Reserved || Req.u32Reserved || Req.idView >= VMI_MEMORY_VIEW_MAX
+                || !(pVM->pgm.s.bmVmiViews & RT_BIT_32(Req.idView)))
+                rc = VERR_INVALID_PARAMETER;
+            else if (pHdr->uType == VMI_MSG_MEMORY_VIEW_SWITCH)
+                rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONE_BY_ONE,
+                                        vmiR3SwitchViewOnEmt, (void *)(uintptr_t)Req.idView);
+            else if (Req.idView == VMI_MEMORY_VIEW_DEFAULT)
+                rc = VERR_INVALID_PARAMETER;
+            else
+            {
+                for (uint32_t idCpu = 0; idCpu < pVM->cCpus; idCpu++)
+                    if (VMMGetCpuById(pVM, idCpu)->pgm.s.Vmi.idView == Req.idView)
+                    {
+                        rc = VERR_INVALID_STATE;
+                        break;
+                    }
+                if (RT_SUCCESS(rc))
+                    rc = VMMR3EmtRendezvous(pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE,
+                                            vmiR3ClearViewRendezvous, (void *)(uintptr_t)Req.idView);
+                if (RT_SUCCESS(rc))
+                    pVM->pgm.s.bmVmiViews &= ~RT_BIT_32(Req.idView);
+            }
+        }
+    }
+    if (RT_SUCCESS(rc))
+        rc = VINF_SUCCESS;
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc,
+                                &idReply, RT_SUCCESS(rc) && pHdr->uType == VMI_MSG_MEMORY_VIEW_CREATE
+                                          ? sizeof(idReply) : 0));
+}
+#endif
+
+/** Handles Hidden-page allocation and release. */
+static bool vmiR3HandleHiddenPage(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cbBody)
+{
+    PVM const pVM = pThis->pUVM->pVM;
+    uint64_t idPage = 0;
+    int rc = VINF_SUCCESS;
+    if (pHdr->uType == VMI_MSG_HIDDEN_PAGE_ALLOC)
+    {
+        if (cbBody)
+            rc = VERR_INVALID_PARAMETER;
+        else
+        {
+            uint32_t iPage = 0;
+            while (iPage < pVM->pgm.s.cVmiHiddenPages && pThis->pbHiddenAllocated[iPage])
+                iPage++;
+            if (iPage == pVM->pgm.s.cVmiHiddenPages)
+                rc = VERR_OUT_OF_RESOURCES;
+            else
+            {
+                pThis->pbHiddenAllocated[iPage] = 1;
+                idPage = (pVM->pgm.s.GCPhysVmiHidden >> GUEST_PAGE_SHIFT) + iPage;
+            }
+        }
+    }
+    else if (cbBody != sizeof(idPage))
+        rc = VERR_INVALID_PARAMETER;
+    else
+    {
+        memcpy(&idPage, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(idPage));
+        uint64_t const idFirst = pVM->pgm.s.GCPhysVmiHidden >> GUEST_PAGE_SHIFT;
+        if (idPage < idFirst || idPage - idFirst >= pVM->pgm.s.cVmiHiddenPages
+            || !pThis->pbHiddenAllocated[idPage - idFirst])
+            rc = VERR_INVALID_PARAMETER;
+        else
+            pThis->pbHiddenAllocated[idPage - idFirst] = 0;
+    }
+    if (RT_SUCCESS(rc))
+        rc = VINF_SUCCESS;
+    return RT_SUCCESS(vmiR3Send(pThis->fdClient, pHdr->idReq, pHdr->uType, VMI_MSG_F_REPLY, rc, &idPage,
+                                RT_SUCCESS(rc) && pHdr->uType == VMI_MSG_HIDDEN_PAGE_ALLOC ? sizeof(idPage) : 0));
+}
+
 /**
  * Sets (in an EMT rendezvous) or gets the page access restriction of a page.
  */
@@ -1842,7 +2151,12 @@ static bool vmiR3HandlePageAccess(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cb
     if (RT_SUCCESS(rc))
     {
         memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
-        if (   Req.u32Reserved
+        if (   Req.u16Reserved
+            || Req.u32Reserved1
+            || Req.u32Reserved2
+            || Req.idView >= VMI_MEMORY_VIEW_MAX
+            || (Req.idView != VMI_MEMORY_VIEW_DEFAULT
+                && !(pThis->pUVM->pVM->pgm.s.bmVmiViews & RT_BIT_32(Req.idView)))
             || (Req.fAccess & ~VMI_PAGE_ACCESS_RWX)
             || (fSet ? (Req.fAccess & (VMI_PAGE_ACCESS_R | VMI_PAGE_ACCESS_W)) == VMI_PAGE_ACCESS_W : Req.fAccess != 0))
             rc = VERR_INVALID_PARAMETER;
@@ -1855,7 +2169,7 @@ static bool vmiR3HandlePageAccess(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cb
             rc = VERR_NOT_SUPPORTED;
         else if (fSet)
         {
-            VMIR3PAGEACCESSSET Set = { Req.GCPhys, Req.fAccess, VINF_SUCCESS };
+            VMIR3PAGEACCESSSET Set = { Req.idView, Req.GCPhys, Req.fAccess, VINF_SUCCESS };
             rc = VMMR3EmtRendezvous(pThis->pUVM->pVM, VMMEMTRENDEZVOUS_FLAGS_TYPE_ONCE, vmiR3PageAccessSetRendezvous, &Set);
             if (RT_SUCCESS(rc))
                 rc = Set.rc;
@@ -1867,7 +2181,7 @@ static bool vmiR3HandlePageAccess(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cb
             PPGMPAGE pPage;
             rc = vmiR3PageAccessLookup(pVM, Req.GCPhys, &pPage);
             if (RT_SUCCESS(rc))
-                fAllowed = VMI_PAGE_ACCESS_RWX & ~PGM_PAGE_GET_VMI_DENIED(pPage);
+                fAllowed = pgmVmiGetPageAccess(pVM, Req.idView, Req.GCPhys);
             PGM_UNLOCK(pVM);
         }
 #else
@@ -1891,7 +2205,12 @@ static bool vmiR3HandleEventReply(PVMIR3 pThis, VMIMSGHDR const *pHdr, size_t cb
     {
         uint8_t const *pbData = (uint8_t const *)pHdr + sizeof(*pHdr) + sizeof(Req);
         memcpy(&Req, (uint8_t const *)pHdr + sizeof(*pHdr), sizeof(Req));
-        if (   (Req.fFlags & ~VMI_EVENT_REPLY_F_REINJECT)
+        if (   Req.u16Reserved
+            || (Req.fFlags & ~VMI_EVENT_REPLY_F_REINJECT)
+            || (   Req.idView != VMI_MEMORY_VIEW_KEEP
+                && (   Req.idView >= VMI_MEMORY_VIEW_MAX
+                    || (Req.idView != VMI_MEMORY_VIEW_DEFAULT
+                        && !(pThis->pUVM->pVM->pgm.s.bmVmiViews & RT_BIT_32(Req.idView)))))
             || Req.cbData != cbBody - sizeof(Req)
             || Req.uAction > VMI_EVENT_REPLY_EMULATE_INSN
             || ((Req.fFlags & VMI_EVENT_REPLY_F_REINJECT) && Req.uAction != VMI_EVENT_REPLY_CONTINUE)
@@ -1972,7 +2291,16 @@ static bool vmiR3HandleMsg(PVMIR3 pThis)
             return vmiR3HandlePauseResume(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_VCPU_COUNT:
             return vmiR3HandleVCpuCount(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
+        case VMI_MSG_HIDDEN_PAGE_ALLOC:
+        case VMI_MSG_HIDDEN_PAGE_FREE:
+            return vmiR3HandleHiddenPage(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
 #ifdef VBOX_VMM_TARGET_X86
+        case VMI_MSG_MEMORY_VIEWS:
+        case VMI_MSG_MEMORY_VIEW_CREATE:
+        case VMI_MSG_MEMORY_VIEW_DESTROY:
+        case VMI_MSG_MEMORY_VIEW_SWITCH:
+        case VMI_MSG_MEMORY_VIEW_REMAP:
+            return vmiR3HandleMemoryView(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
         case VMI_MSG_REGS_READ:
         case VMI_MSG_REGS_WRITE:
             return vmiR3HandleRegs(pThis, (VMIMSGHDR const *)pThis->abMsg, cbBody);
@@ -2208,7 +2536,7 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     *ppvVmi = NULL;
 
     PCFGMNODE pCfg = CFGMR3GetChild(CFGMR3GetRootU(pUVM), "VMI");
-    int rc = CFGMR3ValidateConfig(pCfg, "/VMI/", "Enabled|SocketPath", "", "VMI", 0 /*iInstance*/);
+    int rc = CFGMR3ValidateConfig(pCfg, "/VMI/", "Enabled|SocketPath|HiddenPages", "", "VMI", 0 /*iInstance*/);
     if (RT_FAILURE(rc))
         return rc;
     bool fEnabled;
@@ -2242,7 +2570,9 @@ VMMR3_INT_DECL(int) VMIR3Create(PUVM pUVM, void **ppvVmi)
     {
         pThis->paEvents = (VMIEVENT *)RTMemAllocZ(pUVM->cCpus * sizeof(*pThis->paEvents));
         pThis->paCpus = (PVMIR3CPU)RTMemAllocZ(pUVM->cCpus * sizeof(*pThis->paCpus));
-        if (!pThis->paEvents || !pThis->paCpus)
+        pThis->pbHiddenAllocated = (uint8_t *)RTMemAllocZ(pUVM->pVM->pgm.s.cVmiHiddenPages);
+        if (   !pThis->paEvents || !pThis->paCpus
+            || (pUVM->pVM->pgm.s.cVmiHiddenPages && !pThis->pbHiddenAllocated))
             rc = VERR_NO_MEMORY;
     }
     if (RT_SUCCESS(rc))
@@ -2339,6 +2669,7 @@ VMMR3_INT_DECL(void) VMIR3Terminate(PUVM pUVM, void *pvVmi)
         RTSemFastMutexDestroy(pThis->hMtxEvents);
     RTMemFree(pThis->paEvents);
     RTMemFree(pThis->paCpus);
+    RTMemFree(pThis->pbHiddenAllocated);
     MMR3HeapFree(pThis->pszPath);
     RTMemFree(pThis);
 }

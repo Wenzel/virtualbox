@@ -2108,6 +2108,27 @@ VMMR3DECL(int) PGMR3PhysRegisterRam(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, const
     return rc;
 }
 
+/**
+ * Registers the VBoxVMI Hidden page pool as RAM and records its location.
+ *
+ * @returns VBox status code.
+ * @param   pVM     The cross context VM structure.
+ * @param   cPages  Number of Hidden pages, zero is a no-op.
+ * @param   GCPhys  Guest-physical address of the first Hidden page.
+ */
+VMMR3DECL(int) PGMR3PhysRegisterVmiHidden(PVM pVM, uint32_t cPages, RTGCPHYS GCPhys)
+{
+    if (!cPages)
+        return VINF_SUCCESS;
+    int rc = PGMR3PhysRegisterRam(pVM, GCPhys, (RTGCPHYS)cPages << GUEST_PAGE_SHIFT, "VBoxVMI Hidden RAM");
+    if (RT_SUCCESS(rc))
+    {
+        pVM->pgm.s.GCPhysVmiHidden = GCPhys;
+        pVM->pgm.s.cVmiHiddenPages = cPages;
+    }
+    return rc;
+}
+
 
 #ifndef VBOX_WITH_ONLY_PGM_NEM_MODE
 /**

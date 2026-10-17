@@ -148,12 +148,13 @@ VBOXSTRICTRC iemOpcodeFetchPrefetch(PVMCPUCC pVCpu) RT_NOEXCEPT
     Assert((WalkFast.fEffective & X86_PTE_US) || IEM_GET_CPL(pVCpu) != 3);
     Assert(!(WalkFast.fEffective & X86_PTE_PAE_NX) || !(pVCpu->cpum.GstCtx.msrEFER & MSR_K6_EFER_NXE));
 #endif
-    RTGCPHYS const GCPhys = WalkFast.GCPhys;
+    RTGCPHYS GCPhys = WalkFast.GCPhys;
 
     /* VBoxVMI page access restriction. */
     VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrPC, VMI_PAGE_ACCESS_X);
     if (rcStrictVmi != VINF_SUCCESS)
         return rcStrictVmi;
+    GCPhys = PGMPhysVmiGetRemap(pVCpu, GCPhys);
 
     /*
      * Read the bytes at this address.
@@ -549,12 +550,12 @@ void iemOpcodeFetchBytesJmp(PVMCPUCC pVCpu, size_t cbDst, void *pvDst) IEM_NOEXC
             if (cbToRead > 0)
             {
                 /* VBoxVMI page access restriction (PGM gives restricted pages no mapping, so they come here). */
-                VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, pTlbe->GCPhys + (GCPtrFirst & X86_PAGE_OFFSET_MASK),
-                                                                 GCPtrFirst, VMI_PAGE_ACCESS_X);
+                RTGCPHYS GCPhys = pTlbe->GCPhys + (GCPtrFirst & X86_PAGE_OFFSET_MASK);
+                VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrFirst, VMI_PAGE_ACCESS_X);
                 if (rcStrictVmi != VINF_SUCCESS)
                     IEM_DO_LONGJMP(pVCpu, VBOXSTRICTRC_VAL(rcStrictVmi));
-                VBOXSTRICTRC rcStrict = PGMPhysRead(pVCpu->CTX_SUFF(pVM), pTlbe->GCPhys + (GCPtrFirst & X86_PAGE_OFFSET_MASK),
-                                                    pvDst, cbToRead, PGMACCESSORIGIN_IEM);
+                GCPhys = PGMPhysVmiGetRemap(pVCpu, GCPhys);
+                VBOXSTRICTRC rcStrict = PGMPhysRead(pVCpu->CTX_SUFF(pVM), GCPhys, pvDst, cbToRead, PGMACCESSORIGIN_IEM);
                 if (RT_LIKELY(rcStrict == VINF_SUCCESS))
                 { /* likely */ }
                 else if (PGM_PHYS_RW_IS_SUCCESS(rcStrict))
@@ -697,12 +698,13 @@ VBOXSTRICTRC iemOpcodeFetchMoreBytes(PVMCPUCC pVCpu, size_t cbMin) RT_NOEXCEPT
     Assert((WalkFast.fEffective & X86_PTE_US) || IEM_GET_CPL(pVCpu) != 3);
     Assert(!(WalkFast.fEffective & X86_PTE_PAE_NX) || !(pVCpu->cpum.GstCtx.msrEFER & MSR_K6_EFER_NXE));
 
-    RTGCPHYS const GCPhys = WalkFast.GCPhys;
+    RTGCPHYS GCPhys = WalkFast.GCPhys;
 
     /* VBoxVMI page access restriction. */
     VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhys, GCPtrNext, VMI_PAGE_ACCESS_X);
     if (rcStrictVmi != VINF_SUCCESS)
         return rcStrictVmi;
+    GCPhys = PGMPhysVmiGetRemap(pVCpu, GCPhys);
 
     Log5(("GCPtrNext=%RGv GCPhys=%RGp cbOpcodes=%#x\n",  GCPtrNext,  GCPhys, cbOpcode));
 

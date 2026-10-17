@@ -422,6 +422,14 @@ PGM_BTH_DECL(int, Trap0eHandler)(PVMCPUCC pVCpu, RTGCUINT uErr, PCPUMCTX pCtx, R
 
     *pfLockTaken = false;
 
+# if PGM_SHW_TYPE == PGM_TYPE_EPT
+    /* A non-Default Memory view's Remaps and page-access restrictions live in a ring-3-only
+       heap table (ADR: VBoxVMI Memory views); ring-0 cannot sync its EPT entries accurately,
+       so every access while the vCPU is in one goes to ring-3 instead. */
+    if (pVCpu->pgm.s.Vmi.idView != VMI_MEMORY_VIEW_DEFAULT)
+        return VINF_EM_RAW_EMULATE_INSTR;
+# endif
+
 # if  (   PGM_GST_TYPE == PGM_TYPE_32BIT || PGM_GST_TYPE == PGM_TYPE_REAL || PGM_GST_TYPE == PGM_TYPE_PROT \
        || PGM_GST_TYPE == PGM_TYPE_PAE   || PGM_GST_TYPE == PGM_TYPE_AMD64) \
     && !PGM_TYPE_IS_NESTED(PGM_SHW_TYPE) \
@@ -1953,6 +1961,18 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
                 Assert(!SHW_PTE_IS_P(*pPteDst)); /** @todo user tracking needs updating if this triggers. */
                 return;
             }
+# if PGM_SHW_TYPE == PGM_TYPE_EPT
+            RTGCPHYS const GCPhysMapped = pgmVmiGetRemap(pVM, pShwPage->bVmiView, GCPhysPage);
+            if (GCPhysMapped != GCPhysPage)
+            {
+                rc = pgmPhysGetPageEx(pVM, GCPhysMapped, &pPage);
+                if (RT_FAILURE(rc) || PGM_PAGE_GET_TYPE(pPage) != PGMPAGETYPE_RAM)
+                {
+                    Assert(!SHW_PTE_IS_P(*pPteDst));
+                    return;
+                }
+            }
+# endif
 
 # ifndef VBOX_WITH_NEW_LAZY_PAGE_ALLOC
             /* Make the page writable if necessary. */
@@ -2050,7 +2070,10 @@ static void PGM_BTH_NAME(SyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPteDst, RTGCPH
              * permission as not present, so execute-only and no-access pages are
              * not mapped; the EPT violation handler emulates what is allowed.
              */
-            uint32_t const fVmiDenied = pShwPage->fVmiUnwatched ? 0 : PGM_PAGE_GET_VMI_DENIED(pPage);
+            uint32_t const fVmiDenied = !pShwPage->fVmiUnwatched
+                                      ? VMI_PAGE_ACCESS_RWX
+                                        & ~pgmVmiGetPageAccess(pVM, pShwPage->bVmiView, GCPhysPage)
+                                      : 0;
             if (RT_UNLIKELY(fVmiDenied) && PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_RAM)
             {
                 if (fVmiDenied & VMI_PAGE_ACCESS_R)
@@ -2644,6 +2667,17 @@ static void PGM_BTH_NAME(NestedSyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPte, RTG
     }
 
     Assert(!PGM_PAGE_IS_BALLOONED(pPage));
+    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+    RTGCPHYS const GCPhysMapped = pgmVmiGetRemap(pVM, pShwPage->bVmiView, GCPhysPage);
+    if (GCPhysMapped != GCPhysPage)
+    {
+        rc = pgmPhysGetPageEx(pVM, GCPhysMapped, &pPage);
+        if (RT_FAILURE(rc) || PGM_PAGE_GET_TYPE(pPage) != PGMPAGETYPE_RAM)
+        {
+            SHW_PTE_ATOMIC_SET(*pPte, 0);
+            return;
+        }
+    }
 
     /*
      * Make page table entry.
@@ -2700,10 +2734,11 @@ static void PGM_BTH_NAME(NestedSyncPageWorker)(PVMCPUCC pVCpu, PSHWPTE pPte, RTG
         Pte.u = 0;
     }
 
-    /* Preserve the guest EPT and PGM handler permissions in both views. */
+    /* Preserve the guest EPT and PGM handler permissions in every restricted view. */
     if (!pShwPage->fVmiUnwatched && PGM_PAGE_GET_TYPE(pPage) == PGMPAGETYPE_RAM)
     {
-        uint32_t const fVmiDenied = PGM_PAGE_GET_VMI_DENIED(pPage);
+        uint32_t const fVmiDenied = VMI_PAGE_ACCESS_RWX
+                                  & ~pgmVmiGetPageAccess(pVCpu->CTX_SUFF(pVM), pShwPage->bVmiView, GCPhysPage);
         if (fVmiDenied & VMI_PAGE_ACCESS_R)
             Pte.u = 0;
         else

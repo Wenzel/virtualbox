@@ -57,7 +57,7 @@ RT_C_DECLS_BEGIN
 /** Protocol magic, the bytes "BVMI" on the wire. */
 #define VMI_MAGIC                   UINT32_C(0x494d5642)
 /** Protocol version.  Client and server must match exactly. */
-#define VMI_VERSION                 UINT32_C(2)
+#define VMI_VERSION                 UINT32_C(3)
 /** Maximum size of a message, header included. */
 #define VMI_MSG_SIZE_MAX            _64K
 
@@ -111,6 +111,20 @@ RT_C_DECLS_BEGIN
  *  VMIPAGEACCESS with fAccess zero.  Reply body: a uint32_t, the allowed
  *  VMI_PAGE_ACCESS_XXX. */
 #define VMI_MSG_PAGE_ACCESS_GET     UINT16_C(0x000f)
+/** Enable or disable Memory views. Request body: a uint32_t boolean. */
+#define VMI_MSG_MEMORY_VIEWS        UINT16_C(0x0010)
+/** Create a Memory view. Request body empty; reply body: uint16_t view. */
+#define VMI_MSG_MEMORY_VIEW_CREATE  UINT16_C(0x0011)
+/** Destroy a Memory view. Request body: VMIVIEWREQ. */
+#define VMI_MSG_MEMORY_VIEW_DESTROY UINT16_C(0x0012)
+/** Switch every vCPU to a Memory view. Request body: VMIVIEWREQ. */
+#define VMI_MSG_MEMORY_VIEW_SWITCH  UINT16_C(0x0013)
+/** Set or restore a Remap. Request body: VMIREMAP. */
+#define VMI_MSG_MEMORY_VIEW_REMAP   UINT16_C(0x0014)
+/** Allocate a Hidden page. Request body empty; reply body: uint64_t page number. */
+#define VMI_MSG_HIDDEN_PAGE_ALLOC   UINT16_C(0x0015)
+/** Free a Hidden page. Request body: uint64_t page number. */
+#define VMI_MSG_HIDDEN_PAGE_FREE    UINT16_C(0x0016)
 /** @} */
 
 /** @name Message flags (VMIMSGHDR::fFlags)
@@ -231,19 +245,52 @@ AssertCompileSize(VMIINTERCEPT, 16);
 #define VMI_PAGE_ACCESS_RWX         UINT32_C(7)
 /** @} */
 
+/** Default Memory view. */
+#define VMI_MEMORY_VIEW_DEFAULT     UINT16_C(0)
+/** Keep the parked vCPU's Active view in a reply. */
+#define VMI_MEMORY_VIEW_KEEP        UINT16_MAX
+/** Maximum number of Memory views, including the Default view. */
+#define VMI_MEMORY_VIEW_MAX         16
+/** Restore a Remap's source page. */
+#define VMI_REMAP_RESTORE_PAGE      UINT64_MAX
+
+/** A Memory view request. */
+typedef struct VMIVIEWREQ
+{
+    uint16_t idView;
+    uint16_t u16Reserved;
+    uint32_t u32Reserved;
+} VMIVIEWREQ;
+AssertCompileSize(VMIVIEWREQ, 8);
+
+/** A Remap request; page numbers, not byte addresses. */
+typedef struct VMIREMAP
+{
+    uint16_t idView;
+    uint16_t u16Reserved;
+    uint32_t u32Reserved;
+    uint64_t idPage;
+    uint64_t idTargetPage;
+} VMIREMAP;
+AssertCompileSize(VMIREMAP, 24);
+
 /**
  * Request body of VMI_MSG_PAGE_ACCESS_SET and VMI_MSG_PAGE_ACCESS_GET.
  */
 typedef struct VMIPAGEACCESS
 {
+    /** Memory view. */
+    uint16_t idView;
+    uint16_t u16Reserved;
+    uint32_t u32Reserved1;
     /** A guest-physical address in the 4 KiB page. */
     uint64_t GCPhys;
     /** The allowed accesses, VMI_PAGE_ACCESS_XXX (SET); zero (GET). */
     uint32_t fAccess;
     /** Reserved, zero. */
-    uint32_t u32Reserved;
+    uint32_t u32Reserved2;
 } VMIPAGEACCESS;
-AssertCompileSize(VMIPAGEACCESS, 16);
+AssertCompileSize(VMIPAGEACCESS, 24);
 
 /** VMIEVENTREPLY::fFlags: deliver the intercepted #BP to the guest (breakpoint events only). */
 #define VMI_EVENT_REPLY_F_REINJECT  UINT32_C(1)
@@ -269,6 +316,9 @@ typedef struct VMIEVENTREPLY
 {
     /** The parked vCPU. */
     uint32_t idCpu;
+    /** VMI_MEMORY_VIEW_KEEP, or the Memory view to make Active. */
+    uint16_t idView;
+    uint16_t u16Reserved;
     /** VMI_EVENT_REPLY_F_XXX, other bits zero. */
     uint32_t fFlags;
     /** VMI_EVENT_REPLY_XXX. */
@@ -276,7 +326,7 @@ typedef struct VMIEVENTREPLY
     /** Number of data bytes following: read data or instruction bytes. */
     uint32_t cbData;
 } VMIEVENTREPLY;
-AssertCompileSize(VMIEVENTREPLY, 16);
+AssertCompileSize(VMIEVENTREPLY, 20);
 
 /**
  * Body of VMI_MSG_EVENT.
@@ -285,8 +335,12 @@ typedef struct VMIEVENT
 {
     /** The vCPU, parked until VMI_MSG_EVENT_REPLY. */
     uint32_t idCpu;
+    /** The vCPU's Active view. */
+    uint16_t idView;
+    uint16_t u16Reserved;
     /** The event, VMI_INTERCEPT_XXX. */
     uint32_t uKind;
+    uint32_t u32Reserved;
     /** Guest-physical address of the instruction at RIP (the int3, or the next
      *  one to step), NIL_RTGCPHYS if RIP is not mapped; of the access for page
      *  access events; zero for CR and MSR writes. */
@@ -307,7 +361,7 @@ typedef struct VMIEVENT
     /** The value the write stores; zero for the other kinds. */
     uint64_t uNew;
 } VMIEVENT;
-AssertCompileSize(VMIEVENT, 40);
+AssertCompileSize(VMIEVENT, 48);
 
 /**
  * A segment register in VMIX86REGS: the selector and its hidden base and

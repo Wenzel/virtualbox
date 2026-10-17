@@ -2343,7 +2343,7 @@ static bool pgmPoolCacheReusedByKind(PGMPOOLKIND enmKind1, PGMPOOLKIND enmKind2)
  * @param   ppPage      Where to store the pointer to the page.
  */
 static int pgmPoolCacheAlloc(PPGMPOOL pPool, RTGCPHYS GCPhys, PGMPOOLKIND enmKind, PGMPOOLACCESS enmAccess, bool fA20Enabled,
-                             bool fVmiUnwatched, uint16_t iUser, uint32_t iUserTable, PPPGMPOOLPAGE ppPage)
+                             bool fVmiUnwatched, uint8_t bVmiView, uint16_t iUser, uint32_t iUserTable, PPPGMPOOLPAGE ppPage)
 {
     /*
      * Look up the GCPhys in the hash.
@@ -2361,7 +2361,8 @@ static int pgmPoolCacheAlloc(PPGMPOOL pPool, RTGCPHYS GCPhys, PGMPOOLKIND enmKin
                 if (   (PGMPOOLKIND)pPage->enmKind == enmKind
                     && (PGMPOOLACCESS)pPage->enmAccess == enmAccess
                     && pPage->fA20Enabled == fA20Enabled
-                    && pPage->fVmiUnwatched == fVmiUnwatched)
+                    && pPage->fVmiUnwatched == fVmiUnwatched
+                    && pPage->bVmiView == bVmiView)
                 {
                     /* Put it at the start of the use list to make sure pgmPoolTrackAddUser
                      * doesn't flush it in case there are no more free use records.
@@ -5443,17 +5444,18 @@ int pgmPoolAlloc(PVMCC pVM, RTGCPHYS GCPhys, PGMPOOLKIND enmKind, PGMPOOLACCESS 
 #endif
 
     PGM_LOCK_VOID(pVM);
-    /* EPT descendants inherit their root's view, including nested-guest and 2 MB PTs. */
-    bool const fVmiUnwatched = iUser != NIL_PGMPOOL_IDX
-                            ? pPool->aPages[iUser].fVmiUnwatched
-                            : (   pVCpu->pgm.s.enmShadowMode == PGMMODE_EPT
-                               && (enmKind == PGMPOOLKIND_ROOT_NESTED
-                                   || enmKind == PGMPOOLKIND_EPT_PML4_FOR_EPT_PML4)
-                               && !pVCpu->pgm.s.Vmi.fIntercept);
+    /* EPT descendants inherit their root's Memory-view key. */
+    bool const fEptRoot = pVCpu->pgm.s.enmShadowMode == PGMMODE_EPT
+                        && (enmKind == PGMPOOLKIND_ROOT_NESTED || enmKind == PGMPOOLKIND_EPT_PML4_FOR_EPT_PML4);
+    bool const fVmiUnwatched = iUser != NIL_PGMPOOL_IDX ? pPool->aPages[iUser].fVmiUnwatched
+                             : fEptRoot && !pVCpu->pgm.s.Vmi.fIntercept;
+    uint8_t const bVmiView = iUser != NIL_PGMPOOL_IDX ? pPool->aPages[iUser].bVmiView
+                           : fEptRoot ? (uint8_t)pVCpu->pgm.s.Vmi.idView : 0;
 
     if (pPool->fCacheEnabled)
     {
-        int rc2 = pgmPoolCacheAlloc(pPool, GCPhys, enmKind, enmAccess, fA20Enabled, fVmiUnwatched,
+
+        int rc2 = pgmPoolCacheAlloc(pPool, GCPhys, enmKind, enmAccess, fA20Enabled, fVmiUnwatched, bVmiView,
                                     iUser, iUserTable, ppPage);
         if (RT_SUCCESS(rc2))
         {
@@ -5499,6 +5501,7 @@ int pgmPoolAlloc(PVMCC pVM, RTGCPHYS GCPhys, PGMPOOLKIND enmKind, PGMPOOLACCESS 
     pPage->GCPhys = GCPhys;
     pPage->fA20Enabled = fA20Enabled;
     pPage->fVmiUnwatched = fVmiUnwatched;
+    pPage->bVmiView = bVmiView;
     pPage->fSeenNonGlobal = false;      /* Set this to 'true' to disable this feature. */
     pPage->fMonitored = false;
     pPage->fCached = false;

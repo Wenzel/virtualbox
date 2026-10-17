@@ -5743,24 +5743,69 @@ VMM_INT_DECL(int) PGMPhysIemQueryAccess(PVMCC pVM, RTGCPHYS GCPhys, bool fWritab
 }
 
 /**
- * Gets the accesses allowed in this vCPU's EPT view.  Restrictions only
- * change in an EMT rendezvous, so this lookup needs no lock on a vCPU.
+ * Gets a page restriction for one Memory view.
  *
- * @returns Allowed VMI_PAGE_ACCESS_XXX, RWX when unwatched or unrestricted.
- * @param   pVCpu      The calling vCPU.
- * @param   GCPhys     The guest-physical address.
+ * The Default view's restriction is the per-page PGMPAGE bits, read in every context exactly as
+ * before Memory views existed. Every other view's sparse state lives in a ring-3 process heap
+ * (`VmiPages`), so it is never dereferenced outside ring-3: a page denied there reads as fully
+ * denied elsewhere, which forces the access (or the EPT sync building its PTE) to ring-3, the
+ * only context that resolves it correctly.
  */
+uint32_t pgmVmiGetPageAccess(PVMCC pVM, uint16_t idView, RTGCPHYS GCPhys)
+{
+    if (idView == VMI_MEMORY_VIEW_DEFAULT)
+    {
+        PPGMPAGE pPage = pgmPhysGetPage(pVM, GCPhys);
+        return pPage ? VMI_PAGE_ACCESS_RWX & ~PGM_PAGE_GET_VMI_DENIED(pPage) : VMI_PAGE_ACCESS_RWX;
+    }
+#ifdef IN_RING3
+    if (idView >= VMI_MEMORY_VIEW_MAX || !pVM->pgm.s.cVmiRestrictedPages)
+        return VMI_PAGE_ACCESS_RWX;
+    PPGMVMIPAGE pVmiPage = (PPGMVMIPAGE)RTAvloGCPhysGet(&pVM->pgm.s.VmiPages,
+                                                        GCPhys & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK);
+    return pVmiPage ? VMI_PAGE_ACCESS_RWX & ~pVmiPage->afDenied[idView] : VMI_PAGE_ACCESS_RWX;
+#else
+    RT_NOREF(GCPhys);
+    return idView < VMI_MEMORY_VIEW_MAX ? 0 : VMI_PAGE_ACCESS_RWX;
+#endif
+}
+
+/**
+ * Resolves one page through a Memory view, preserving the byte offset.
+ *
+ * The Default view never remaps. Every other view's Remaps live in the ring-3-only `VmiPages`
+ * heap (see {@link pgmVmiGetPageAccess}); outside ring-3 an unresolved remap reads as
+ * `NIL_RTGCPHYS`, an address nothing backs, so the caller treats the page as not present and
+ * the access escalates to ring-3.
+ */
+RTGCPHYS pgmVmiGetRemap(PVMCC pVM, uint16_t idView, RTGCPHYS GCPhys)
+{
+    if (idView == VMI_MEMORY_VIEW_DEFAULT || idView >= VMI_MEMORY_VIEW_MAX)
+        return GCPhys;
+#ifdef IN_RING3
+    PPGMVMIPAGE pVmiPage = (PPGMVMIPAGE)RTAvloGCPhysGet(&pVM->pgm.s.VmiPages,
+                                                        GCPhys & ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK);
+    if (!pVmiPage || pVmiPage->aidRemap[idView] == VMI_REMAP_RESTORE_PAGE)
+        return GCPhys;
+    return pVmiPage->aidRemap[idView] * GUEST_PAGE_SIZE + (GCPhys & GUEST_PAGE_OFFSET_MASK);
+#else
+    RT_NOREF(pVM);
+    return NIL_RTGCPHYS;
+#endif
+}
+
+/** Gets the accesses allowed in this vCPU's EPT view. */
 VMM_INT_DECL(uint32_t) PGMPhysVmiGetPageAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys)
 {
     if (RT_LIKELY(!pVCpu->pgm.s.Vmi.fIntercept))
         return VMI_PAGE_ACCESS_RWX;
-    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
-    if (RT_LIKELY(!pVM->pgm.s.cVmiRestrictedPages))
-        return VMI_PAGE_ACCESS_RWX;
-    PPGMPAGE pPage = pgmPhysGetPage(pVM, GCPhys);
-    if (!pPage || PGM_PAGE_GET_TYPE(pPage) != PGMPAGETYPE_RAM)
-        return VMI_PAGE_ACCESS_RWX;
-    return VMI_PAGE_ACCESS_RWX & ~PGM_PAGE_GET_VMI_DENIED(pPage);
+    return pgmVmiGetPageAccess(pVCpu->CTX_SUFF(pVM), pVCpu->pgm.s.Vmi.idView, GCPhys);
+}
+
+/** Resolves one guest-physical address through this vCPU's Active Memory view. */
+VMM_INT_DECL(RTGCPHYS) PGMPhysVmiGetRemap(PVMCPUCC pVCpu, RTGCPHYS GCPhys)
+{
+    return pgmVmiGetRemap(pVCpu->CTX_SUFF(pVM), pVCpu->pgm.s.Vmi.idView, GCPhys);
 }
 
 

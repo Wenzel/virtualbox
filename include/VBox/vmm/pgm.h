@@ -1241,6 +1241,7 @@ VMM_INT_DECL(int)   PGMPhysIemGCPhys2PtrNoLock(PVMCC pVM, PVMCPUCC pVCpu, RTGCPH
 
 VMM_INT_DECL(uint32_t)     PGMPhysVmiGetPageAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys);
 VMM_INT_DECL(VBOXSTRICTRC) PGMPhysVmiCheckAccess(PVMCPUCC pVCpu, RTGCPHYS GCPhys, RTGCPTR GCPtr, uint32_t fAccess);
+VMM_INT_DECL(RTGCPHYS)     PGMPhysVmiGetRemap(PVMCPUCC pVCpu, RTGCPHYS GCPhys);
 VMM_INT_DECL(bool)         PGMPhysVmiEmulReadData(PVMCPUCC pVCpu, void *pvBuf, size_t cbBuf);
 #ifdef IN_RING3
 VMMR3_INT_DECL(bool)       PGMPhysVmiIsEmulationRam(PVMCC pVM, RTGCPHYS GCPhys, uint32_t fAccess);
@@ -1481,6 +1482,7 @@ VMMR3_INT_DECL(void)    PGMR3MemSetup(PVM pVM, bool fReset);
 VMMR3DECL(int)      PGMR3Term(PVM pVM);
 
 VMMR3DECL(int)      PGMR3PhysRegisterRam(PVM pVM, RTGCPHYS GCPhys, RTGCPHYS cb, const char *pszDesc);
+VMMR3DECL(int)      PGMR3PhysRegisterVmiHidden(PVM pVM, uint32_t cPages, RTGCPHYS GCPhys);
 VMMR3DECL(int)      PGMR3PhysChangeMemBalloon(PVM pVM, bool fInflate, unsigned cPages, RTGCPHYS *paPhysPage);
 VMMR3DECL(int)      PGMR3PhysWriteProtectRAM(PVM pVM);
 VMMR3DECL(uint32_t) PGMR3PhysGetRamRangeCount(PVM pVM);

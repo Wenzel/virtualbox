@@ -2360,19 +2360,22 @@ VMMDECL(RTHCPHYS) PGMGetHyperCR3(PVMCPU pVCpu)
 # if defined(IN_RING3) && !defined(VBOX_WITH_ONLY_PGM_NEM_MODE)
 /**
  * Selects an EPT pool tree for this EMT without changing any other vCPU's EPT.
- * The pool keys root and descendants by view; the old root can remain cached.
+ * The pool keys root and descendants by Memory view and restriction bypass state.
  */
-int pgmVmiSwitchEptView(PVMCPU pVCpu, bool fIntercept)
+int pgmVmiSwitchEptView(PVMCPU pVCpu, uint16_t idView, bool fIntercept)
 {
     PVM pVM = pVCpu->CTX_SUFF(pVM);
     PGM_LOCK_VOID(pVM);
-    if (pVCpu->pgm.s.Vmi.fIntercept == fIntercept)
+    if (pVCpu->pgm.s.Vmi.idView == idView && pVCpu->pgm.s.Vmi.fIntercept == fIntercept)
     {
         PGM_UNLOCK(pVM);
         return VINF_SUCCESS;
     }
 
     PPGMPOOLPAGE pOldRoot = pVCpu->pgm.s.pShwPageCR3R3;
+    uint16_t const idOldView = pVCpu->pgm.s.Vmi.idView;
+    bool const fOldIntercept = pVCpu->pgm.s.Vmi.fIntercept;
+    pVCpu->pgm.s.Vmi.idView = idView;
     pVCpu->pgm.s.Vmi.fIntercept = fIntercept;
     if (pVCpu->pgm.s.enmShadowMode == PGMMODE_EPT && pOldRoot)
     {
@@ -2391,12 +2394,13 @@ int pgmVmiSwitchEptView(PVMCPU pVCpu, bool fIntercept)
                               NIL_PGMPOOL_IDX, UINT32_MAX, true /* fLockPage */, &pNewRoot);
         if (RT_FAILURE(rc))
         {
-            pVCpu->pgm.s.Vmi.fIntercept = !fIntercept;
+            pVCpu->pgm.s.Vmi.idView = idOldView;
+            pVCpu->pgm.s.Vmi.fIntercept = fOldIntercept;
             PGM_UNLOCK(pVM);
             return rc;
         }
         Assert(pOldRoot != pNewRoot);
-        Assert(pOldRoot->fVmiUnwatched == fIntercept && pNewRoot->fVmiUnwatched == !fIntercept);
+        Assert(pNewRoot->fVmiUnwatched == !fIntercept && pNewRoot->bVmiView == idView);
         pVCpu->pgm.s.pShwPageCR3R3 = pgmPoolConvertPageToR3(pPool, pNewRoot);
         pVCpu->pgm.s.pShwPageCR3R0 = pgmPoolConvertPageToR0(pPool, pNewRoot);
         pgmPoolUnlockPage(pPool, pOldRoot);

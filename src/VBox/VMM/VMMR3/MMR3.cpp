@@ -427,6 +427,21 @@ static int mmR3InitRamX86(PVM pVM, PCFGMNODE pMMCfg)
     else
         Log(("MM: %RU64 bytes of RAM with a hole at %RU64 up to 4GB.\n", cbRam, offRamHole));
 
+    uint32_t cVmiHiddenPages = 0;
+    PCFGMNODE pVmiCfg = CFGMR3GetChild(CFGMR3GetRoot(pVM), "VMI");
+    if (pVmiCfg)
+    {
+        rc = CFGMR3QueryU32Def(pVmiCfg, "HiddenPages", &cVmiHiddenPages, 0);
+        AssertLogRelMsgRCReturn(rc, ("Configuration error: Failed to query integer \"VMI/HiddenPages\", rc=%Rrc.\n", rc), rc);
+    }
+    uint64_t const cbVmiHidden = (uint64_t)cVmiHiddenPages << GUEST_PAGE_SHIFT;
+    RTGCPHYS const GCPhysVmiHidden = cbRam > offRamHole ? _4G + cbRam - offRamHole : cbRam;
+    AssertLogRelMsgReturn(   !cVmiHiddenPages
+                         || (GCPhysVmiHidden <= GMM_GCPHYS_LAST
+                             && cbVmiHidden - 1 <= GMM_GCPHYS_LAST - GCPhysVmiHidden),
+                         ("VMI/HiddenPages=%RU32 does not fit at %RGp\n", cVmiHiddenPages, GCPhysVmiHidden),
+                         VERR_OUT_OF_RANGE);
+
     /** @cfgm{/MM/Policy, string, no overcommitment}
      * Specifies the policy to use when reserving memory for this VM. The recognized
      * value is 'no overcommitment' (default). See GMMPOLICY.
@@ -474,7 +489,7 @@ static int mmR3InitRamX86(PVM pVM, PCFGMNODE pMMCfg)
      * Make the initial memory reservation with GMM.
      */
     uint32_t const cbUma      = _1M - 640*_1K;
-    uint64_t       cBasePages = ((cbRam - cbUma) >> GUEST_PAGE_SHIFT) + pVM->mm.s.cBasePages;
+    uint64_t       cBasePages = ((cbRam - cbUma) >> GUEST_PAGE_SHIFT) + pVM->mm.s.cBasePages + cVmiHiddenPages;
     rc = GMMR3InitialReservation(pVM,
                                  RT_MAX(cBasePages + pVM->mm.s.cHandyPages, 1),
                                  RT_MAX(pVM->mm.s.cShadowPages, 1),
@@ -523,6 +538,8 @@ static int mmR3InitRamX86(PVM pVM, PCFGMNODE pMMCfg)
                 rc = PGMR3PhysRegisterRam(pVM, _4G, cbRam - offRamHole, "Above 4GB Base RAM");
         }
     }
+    if (RT_SUCCESS(rc))
+        rc = PGMR3PhysRegisterVmiHidden(pVM, cVmiHiddenPages, GCPhysVmiHidden);
 
     AssertMsg(pVM->mm.s.cBasePages == cBasePages || RT_FAILURE(rc), ("%RX64 != %RX64\n", pVM->mm.s.cBasePages, cBasePages));
     return rc;

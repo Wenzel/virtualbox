@@ -46,6 +46,7 @@
 #include <VBox/log.h>
 #include <VBox/vmm/gmm.h>
 #include <VBox/vmm/hm.h>
+#include <VBox/vmm/vmi.h>
 #include <iprt/asm.h>
 #include <iprt/assert.h>
 #include <iprt/avl.h>
@@ -1216,6 +1217,15 @@ typedef PPGMPAGE *PPPGMPAGE;
 #define PGM_PAGE_SET_VMI_DENIED(a_pPage, a_fDenied) \
     do { (a_pPage)->s.u3VmiDeniedY = (a_fDenied); } while (0)
 
+/** Sparse VBoxVMI state for one guest-physical page. */
+typedef struct PGMVMIPAGE
+{
+    AVLOGCPHYSNODECORE Core;
+    uint64_t           aidRemap[VMI_MEMORY_VIEW_MAX];
+    uint8_t            afDenied[VMI_MEMORY_VIEW_MAX];
+} PGMVMIPAGE;
+typedef PGMVMIPAGE *PPGMVMIPAGE;
+
 /** @def PGM_PAGE_GET_TRACKING
  * Gets the packed shadow page pool tracking data associated with a guest page.
  * @returns uint16_t containing the data.
@@ -2103,9 +2113,11 @@ typedef struct PGMPOOLPAGE
     /** Used to mark the page as dirty (write monitoring is temporarily
      *  off). */
     bool                fDirty : 1;
-    /** EPT view without VBoxVMI restrictions; inherited from the parent pool page. */
+    /** EPT tree key: set if this subtree bypasses VBoxVMI page-access restrictions
+     *  (the page-access Intercept was inactive when this root was allocated). */
     bool                fVmiUnwatched : 1;
-    bool                fPadding2;
+    /** EPT tree key: the Memory view (0 is Default), independent of fVmiUnwatched. */
+    uint8_t             bVmiView;
 
     /** The index of this page. */
     uint16_t            idx;
@@ -3335,6 +3347,14 @@ typedef struct PGM
     /** The number of pages with a VBoxVMI page access restriction
      * (PGMPAGE::u3VmiDeniedY), changed in an EMT rendezvous. */
     uint32_t                        cVmiRestrictedPages;
+    /** Sparse per-page VBoxVMI Memory-view state, keyed by page-aligned GPA. */
+    AVLOGCPHYSTREE                 VmiPages;
+    /** Allocated Memory views; bit zero is always set while views are enabled. */
+    uint32_t                       bmVmiViews;
+    /** First guest-physical byte of the Hidden page pool. */
+    RTGCPHYS                       GCPhysVmiHidden;
+    /** Number of pages in the Hidden page pool. */
+    uint32_t                       cVmiHiddenPages;
 
     STAMPROFILE                     StatLargePageAlloc;     /**< Time spent by the host OS for large page allocation. */
     STAMCOUNTER                     StatLargePageAllocFailed; /**< Count allocation failures. */
@@ -3786,7 +3806,8 @@ typedef struct PGMCPU
         bool                        fEmulating;
         /** The reported access, VMI_PAGE_ACCESS_XXX; zero if none is pending. */
         uint8_t                     fHitAccess;
-        uint8_t                     bPadding;
+        /** The Active Memory view. */
+        uint16_t                    idView;
         /** Bytes of pbReadData the emulated instruction has read. */
         uint16_t                    offReadData;
         /** Size of pbReadData, zero unless an EMULATE_READ_DATA reply runs. */
@@ -4091,8 +4112,10 @@ int             pgmR0PoolInitVM(PGVM pGVM);
 int             pgmPoolAlloc(PVMCC pVM, RTGCPHYS GCPhys, PGMPOOLKIND enmKind, PGMPOOLACCESS enmAccess, bool fA20Enabled,
                              uint16_t iUser, uint32_t iUserTable, bool fLockPage, PPPGMPOOLPAGE ppPage);
 # if defined(IN_RING3) && defined(VBOX_VMM_TARGET_X86)
-int             pgmVmiSwitchEptView(PVMCPU pVCpu, bool fIntercept);
+int             pgmVmiSwitchEptView(PVMCPU pVCpu, uint16_t idView, bool fIntercept);
 # endif
+uint32_t        pgmVmiGetPageAccess(PVMCC pVM, uint16_t idView, RTGCPHYS GCPhys);
+RTGCPHYS        pgmVmiGetRemap(PVMCC pVM, uint16_t idView, RTGCPHYS GCPhys);
 void            pgmPoolFree(PVM pVM, RTHCPHYS HCPhys, uint16_t iUser, uint32_t iUserTable);
 void            pgmPoolFreeByPage(PPGMPOOL pPool, PPGMPOOLPAGE pPage, uint16_t iUser, uint32_t iUserTable);
 int             pgmPoolFlushPage(PPGMPOOL pPool, PPGMPOOLPAGE pPage, bool fFlush = true /* DO NOT USE false UNLESS YOU KNOWN WHAT YOU'RE DOING!! */);

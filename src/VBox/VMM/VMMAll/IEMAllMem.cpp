@@ -383,6 +383,7 @@ VBOXSTRICTRC iemMemBounceBufferMapCrossPage(PVMCPUCC pVCpu, int iMemMap, void **
     Assert((GCPhysSecond & GUEST_PAGE_OFFSET_MASK) == 0);
     GCPhysSecond &= ~(RTGCPHYS)GUEST_PAGE_OFFSET_MASK; /** @todo why? */
 
+    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
     /*
      * VBoxVMI page access restrictions, in the order the CPU faults.
      */
@@ -395,7 +396,8 @@ VBOXSTRICTRC iemMemBounceBufferMapCrossPage(PVMCPUCC pVCpu, int iMemMap, void **
     if (rcStrict != VINF_SUCCESS)
         return rcStrict;
 
-    PVMCC pVM = pVCpu->CTX_SUFF(pVM);
+    GCPhysFirst = PGMPhysVmiGetRemap(pVCpu, GCPhysFirst);
+    GCPhysSecond = PGMPhysVmiGetRemap(pVCpu, GCPhysSecond);
 
     /*
      * Check for data breakpoints.
@@ -555,6 +557,10 @@ VBOXSTRICTRC iemMemBounceBufferMapPhys(PVMCPUCC pVCpu, unsigned iMemMap, void **
     VBOXSTRICTRC rcStrictVmi = PGMPhysVmiCheckAccess(pVCpu, GCPhysFirst, 0 /*GCPtr*/, fAccess & IEM_ACCESS_TYPE_MASK);
     if (rcStrictVmi != VINF_SUCCESS)
         return rcStrictVmi;
+    RTGCPHYS const GCPhysSource = GCPhysFirst;
+    GCPhysFirst = PGMPhysVmiGetRemap(pVCpu, GCPhysFirst);
+    if (GCPhysFirst != GCPhysSource)
+        rcMap = VERR_PGM_PHYS_TLB_CATCH_ALL;
 
     /*
      * Read in the current memory content if it's a read, execute or partial
